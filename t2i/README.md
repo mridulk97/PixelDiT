@@ -48,6 +48,8 @@ Training is launched via `train.sh` with a config YAML. The typical pipeline:
 2. **Stage 2** — Continue at 512×512 with multi-aspect ratio (no REPA loss)
 3. **Stage 3** — Fine-tune at 1024×1024 with multi-aspect ratio (no REPA loss)
 
+Note that at Stage 1, we do observe significantly faster convergence when using REPA loss. At Stage 2 and 3, our intuition is that the model has already been trained to a good point, so we stop using REPA loss and only use the flow matching loss. We have not done a thorough ablation on the REPA loss at higher resolution and later-stage training yet, due to the computation cost limitation. We welcome more discussions. 
+
 ### Stage 1: 512×512 Pre-training
 
 ```bash
