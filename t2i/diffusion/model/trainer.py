@@ -65,6 +65,25 @@ class PixDiTTrainer(nn.Module):
         repa_encoder_index = int(extra.get("repa_encoder_index", -1))
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
+        model_config = getattr(config, "model", None) if config is not None else None
+        conditioning_mode = str(
+            getattr(model_config, "conditioning_mode", extra.get("conditioning_mode", "none"))
+        )
+        sequence_rope_mode = str(
+            getattr(model_config, "sequence_rope_mode", extra.get("sequence_rope_mode", "aligned"))
+        )
+        sequence_rope_offset = getattr(
+            model_config,
+            "sequence_rope_offset",
+            extra.get("sequence_rope_offset", None),
+        )
+        use_sequence_type_embedding = bool(
+            getattr(
+                model_config,
+                "use_sequence_type_embedding",
+                extra.get("use_sequence_type_embedding", True),
+            )
+        )
 
         if PixDiT_T2I is None:
             raise ImportError("Failed to import PixDiT_T2I from pixdit_core.pixeldit_t2i. Check repo layout and PYTHONPATH.")
@@ -86,6 +105,10 @@ class PixDiTTrainer(nn.Module):
             repa_encoder_index=repa_encoder_index,
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
+            conditioning_mode=conditioning_mode,
+            sequence_rope_mode=sequence_rope_mode,
+            sequence_rope_offset=sequence_rope_offset,
+            use_sequence_type_embedding=use_sequence_type_embedding,
         )
 
         self.image_size = int(image_size)
@@ -105,7 +128,48 @@ class PixDiTTrainer(nn.Module):
             nn.Linear(projector_dim, 768),
         )
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, repa_tokens=None, **kwargs):
+    def _adapt_conditioning_input_weights(self, state_dict):
+        """Expand pretrained input projections for channel-concat modes."""
+        adapted = state_dict.copy()
+        for key in (
+            "core.s_embedder.proj.weight",
+            "core.pixel_embedder.proj.weight",
+        ):
+            if key not in adapted:
+                continue
+            target = self.state_dict().get(key)
+            source = adapted[key]
+            if target is None or tuple(source.shape) == tuple(target.shape):
+                continue
+            if source.ndim != 2 or target.ndim != 2:
+                continue
+            if target.shape[0] == source.shape[0] and target.shape[1] == 2 * source.shape[1]:
+                adapted[key] = torch.cat([source, source], dim=1) / (2.0 ** 0.5)
+            else:
+                raise RuntimeError(
+                    f"Cannot adapt pretrained projection {key}: checkpoint {tuple(source.shape)} "
+                    f"vs model {tuple(target.shape)}"
+                )
+        return adapted
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = self._adapt_conditioning_input_weights(state_dict)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
+
+    def forward(
+        self,
+        x,
+        timestep,
+        y,
+        mask=None,
+        data_info=None,
+        repa_tokens=None,
+        condition_image=None,
+        **kwargs,
+    ):
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         if y.dim() == 4:
@@ -125,7 +189,16 @@ class PixDiTTrainer(nn.Module):
         if hasattr(self.core, "last_repa_tokens"):
             self.core.last_repa_tokens = None
 
-        out = self.core(x, timestep, y_proc, s=None, mask=None)
+        if condition_image is not None:
+            condition_image = condition_image.to(device=x.device, dtype=self.dtype)
+        out = self.core(
+            x,
+            timestep,
+            y_proc,
+            condition_image=condition_image,
+            s=None,
+            mask=None,
+        )
         repa_loss = None
         if repa_tokens is not None:
             repa_tokens = repa_tokens.to(self.dtype)
@@ -165,5 +238,3 @@ class PixDiTTrainer(nn.Module):
     @property
     def dtype(self):
         return next(self.parameters()).dtype
-
-

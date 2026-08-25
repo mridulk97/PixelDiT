@@ -4,7 +4,25 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.functional import scaled_dot_product_attention
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.functional import scaled_dot_product_attention as torch_scaled_dot_product_attention
+
+
+def scaled_dot_product_attention_compat(q, k, v, attn_mask=None, dropout_p=0.0):
+    """Use CUDA SDPA kernels without the unsupported cuDNN frontend path."""
+    backends = [
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
+    with sdpa_kernel(backends):
+        return torch_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+        )
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
@@ -129,9 +147,23 @@ class FeedForward(nn.Module):
         return x
 
 
-def precompute_freqs_cis_2d(dim: int, height: int, width: int, theta: float = 10000.0, scale=16.0):
-    x_pos = torch.linspace(0, scale, width)
-    y_pos = torch.linspace(0, scale, height)
+def precompute_freqs_cis_2d(
+    dim: int,
+    height: int,
+    width: int,
+    theta: float = 10000.0,
+    scale=16.0,
+    offset=(0.0, 0.0),
+):
+    """Build 2D RoPE frequencies, optionally translating the spatial grid.
+
+    ``offset`` is ``(y, x)`` in the same continuous coordinate system as
+    ``scale``.  The default is bit-for-bit compatible with the pretrained
+    PixelDiT position construction.
+    """
+    y_offset, x_offset = offset
+    x_pos = torch.linspace(0, scale, width) + float(x_offset)
+    y_pos = torch.linspace(0, scale, height) + float(y_offset)
     y_pos, x_pos = torch.meshgrid(y_pos, x_pos, indexing="ij")
     y_pos = y_pos.reshape(-1)
     x_pos = x_pos.reshape(-1)
@@ -212,7 +244,7 @@ class RotaryAttention(nn.Module):
         k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
         v = v.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
 
-        x = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        x = scaled_dot_product_attention_compat(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -248,4 +280,3 @@ class FinalLayer(nn.Module):
         x = self.norm(x)
         x = self.linear(x)
         return x
-
