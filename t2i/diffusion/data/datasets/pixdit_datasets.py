@@ -220,6 +220,157 @@ class PixDiTImageDataset(Dataset):
         return len(self.dataset)
 
 
+@DATASETS.register_module(name="AM2KMattingDataset")
+class AM2KMattingDataset(Dataset):
+    """Paired real RGB/alpha samples from the official AM-2K split."""
+
+    def __init__(
+        self,
+        data_dir="",
+        transform=None,
+        resolution=1024,
+        max_length=300,
+        config=None,
+        extra=None,
+        **kwargs,
+    ):
+        del transform, kwargs
+        options = extra or {}
+        if not isinstance(options, dict):
+            options = vars(options)
+        roots = data_dir if isinstance(data_dir, list) else [data_dir]
+        if len(roots) != 1:
+            raise ValueError("AM2KMattingDataset expects exactly one data root")
+        self.root = osp.abspath(osp.expanduser(str(roots[0])))
+        self.split = str(options.get("split", "train"))
+        if self.split not in {"train", "validation"}:
+            raise ValueError("AM-2K split must be 'train' or 'validation'")
+        self.resolution = int(resolution)
+        self.max_length = int(max_length)
+        self.default_prompt = str(
+            options.get(
+                "default_prompt",
+                "Transform to matting map while maintaining original composition",
+            )
+        )
+        self.overfit_samples = int(options.get("overfit_samples", 0) or 0)
+        self.overfit_seed = int(options.get("overfit_seed", 2025))
+        self.load_text_feat = False
+
+        metadata_path = osp.join(self.root, "am2k_split_category.json")
+        if not osp.isfile(metadata_path):
+            raise FileNotFoundError(f"Missing AM-2K metadata: {metadata_path}")
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+        original_dir = osp.join(self.root, self.split, "original")
+        mask_dir = osp.join(self.root, self.split, "mask")
+        if not osp.isdir(original_dir) or not osp.isdir(mask_dir):
+            raise FileNotFoundError(
+                f"AM-2K is not extracted: expected {original_dir} and {mask_dir}"
+            )
+
+        records = []
+        for sample_id, sample_info in sorted(metadata.items()):
+            if sample_info.get("split") != self.split:
+                continue
+            image_path = osp.join(original_dir, f"{sample_id}.jpg")
+            alpha_path = osp.join(mask_dir, f"{sample_id}.png")
+            if not osp.isfile(image_path) or not osp.isfile(alpha_path):
+                raise FileNotFoundError(
+                    f"Incomplete AM-2K pair for {sample_id}: {image_path}, {alpha_path}"
+                )
+            records.append(
+                {
+                    "sample_id": sample_id,
+                    "category": str(sample_info["category"]),
+                    "image_path": image_path,
+                    "alpha_path": alpha_path,
+                }
+            )
+
+        expected = 1800 if self.split == "train" else 200
+        if len(records) != expected:
+            raise RuntimeError(
+                f"Expected {expected} AM-2K {self.split} pairs, found {len(records)}"
+            )
+        self.full_dataset_size = len(records)
+        if self.overfit_samples > 0:
+            records = self._category_stratified_subset(records, self.overfit_samples, self.overfit_seed)
+        self.dataset = records
+        self.ori_imgs_nums = len(self.dataset)
+        self.logger = (
+            get_root_logger()
+            if config is None
+            else get_root_logger(osp.join(config.work_dir, "train_log.log"))
+        )
+        self.logger.info(
+            f"AM-2K {self.split}: using {len(self.dataset)}/{self.full_dataset_size} paired samples "
+            f"at {self.resolution}x{self.resolution}"
+        )
+
+    @staticmethod
+    def _category_stratified_subset(records, count, seed):
+        if count > len(records):
+            raise ValueError(f"overfit_samples={count} exceeds dataset size {len(records)}")
+        rng = random.Random(seed)
+        buckets = {}
+        for record in records:
+            buckets.setdefault(record["category"], []).append(record)
+        categories = sorted(buckets)
+        rng.shuffle(categories)
+        for bucket in buckets.values():
+            rng.shuffle(bucket)
+        selected = []
+        offset = 0
+        while len(selected) < count:
+            made_progress = False
+            for category in categories:
+                bucket = buckets[category]
+                if offset < len(bucket):
+                    selected.append(bucket[offset])
+                    made_progress = True
+                    if len(selected) == count:
+                        break
+            if not made_progress:
+                break
+            offset += 1
+        return selected
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        record = self.dataset[idx]
+        image = Image.open(record["image_path"]).convert("RGB")
+        alpha = Image.open(record["alpha_path"]).convert("L")
+        target_size = (self.resolution, self.resolution)
+        image = image.resize(target_size, Image.Resampling.BICUBIC)
+        alpha = alpha.resize(target_size, Image.Resampling.BILINEAR)
+
+        condition = T.ToTensor()(image) * 2.0 - 1.0
+        alpha_tensor = T.ToTensor()(alpha) * 2.0 - 1.0
+        alpha_rgb = alpha_tensor.repeat(3, 1, 1)
+        attention_mask = torch.ones(1, 1, self.max_length, dtype=torch.int16)
+        data_info = {
+            "img_hw": torch.tensor([self.resolution, self.resolution], dtype=torch.float32),
+            "aspect_ratio": torch.tensor(1.0),
+            "sample_id": record["sample_id"],
+            "category": record["category"],
+        }
+        return (
+            alpha_rgb,
+            self.default_prompt,
+            attention_mask,
+            data_info,
+            idx,
+            "prompt",
+            record["sample_id"],
+            record["category"],
+            condition,
+        )
+
+
 @DATASETS.register_module()
 class PixDiTWebDataset(Dataset):
     """WebDataset-based pixel-space loader."""
@@ -797,6 +948,5 @@ class PixelDatasetMS(PixDiTWebDataset):
             dataindex_info,
             str(caption_clipscore),
         )
-
 
 

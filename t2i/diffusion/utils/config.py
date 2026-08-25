@@ -81,6 +81,10 @@ class ModelConfig(BaseConfig):
     cfg_embed: bool = False
     cfg_embed_scale: float = 1.0
     guidance_type: str = "classifier-free"
+    conditioning_mode: str = "none"
+    sequence_rope_mode: str = "aligned"
+    sequence_rope_offset: Optional[float] = None
+    use_sequence_type_embedding: bool = True
     # for ladd
     ladd_multi_scale: bool = True
     head_block_ids: Optional[List[int]] = None
@@ -162,6 +166,14 @@ class TrainingConfig(BaseConfig):
     use_flash_attn: bool = False
     eval_sampling_steps: int = 250
     lora_rank: int = 4
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    max_train_steps: int = 1000
+    adapter_save_steps: int = 100
+    wandb_log_images: bool = False
+    wandb_image_interval: int = 100
+    wandb_sampling_steps: int = 20
+    wandb_num_examples: int = 1
     log_interval: int = 50
     mask_type: str = "null"
     mask_loss_coef: float = 0.0

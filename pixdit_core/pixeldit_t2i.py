@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from typing import Tuple
 
@@ -13,6 +14,7 @@ from .modules import (
     apply_adaln,
     apply_rotary_emb,
     precompute_freqs_cis_2d,
+    scaled_dot_product_attention_compat,
 )
 
 
@@ -83,7 +85,13 @@ class MMDiTJointAttention(nn.Module):
         k_joint = torch.cat([ky, kx], dim=2)
         v_joint = torch.cat([vy, vx], dim=2)
 
-        out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
+        out_joint = scaled_dot_product_attention_compat(
+            q_joint,
+            k_joint,
+            v_joint,
+            dropout_p=0.0,
+            attn_mask=attn_mask,
+        )
         out_y = out_joint[:, :, :Ny, :]
         out_x = out_joint[:, :, Ny:, :]
 
@@ -152,6 +160,10 @@ class PixDiT_T2I(nn.Module):
         repa_encoder_index: int = -1,
         use_pixel_abs_pos: bool = True,
         pit_adaln_post_modulation: bool = False,
+        conditioning_mode: str = "none",
+        sequence_rope_mode: str = "aligned",
+        sequence_rope_offset: float = None,
+        use_sequence_type_embedding: bool = True,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -170,11 +182,40 @@ class PixDiT_T2I(nn.Module):
         self.repa_encoder_index = int(repa_encoder_index)
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
+        self.conditioning_mode = str(conditioning_mode).lower()
+        self.sequence_rope_mode = str(sequence_rope_mode).lower()
+        self.sequence_rope_offset = (
+            None if sequence_rope_offset is None else float(sequence_rope_offset)
+        )
+        self.use_sequence_type_embedding = bool(use_sequence_type_embedding)
+        valid_conditioning_modes = {"none", "patch", "pixel", "both", "sequence"}
+        if self.conditioning_mode not in valid_conditioning_modes:
+            raise ValueError(
+                f"conditioning_mode must be one of {sorted(valid_conditioning_modes)}, "
+                f"got {self.conditioning_mode!r}"
+            )
+        if self.sequence_rope_mode not in {"aligned", "offset"}:
+            raise ValueError("sequence_rope_mode must be 'aligned' or 'offset'")
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
-        self.pixel_embedder = PixelTokenEmbedder(in_channels, self.pixel_hidden_size, use_pixel_abs_pos=self.use_pixel_abs_pos)
-        self.s_embedder = PatchTokenEmbedder(in_channels * patch_size ** 2, hidden_size, bias=True)
+        patch_input_channels = in_channels * patch_size ** 2
+        pixel_input_channels = in_channels
+        if self.conditioning_mode in {"patch", "both"}:
+            patch_input_channels *= 2
+        if self.conditioning_mode in {"pixel", "both"}:
+            pixel_input_channels *= 2
+
+        self.pixel_embedder = PixelTokenEmbedder(
+            pixel_input_channels,
+            self.pixel_hidden_size,
+            use_pixel_abs_pos=self.use_pixel_abs_pos,
+        )
+        self.s_embedder = PatchTokenEmbedder(patch_input_channels, hidden_size, bias=True)
+        if self.conditioning_mode == "sequence" and self.use_sequence_type_embedding:
+            self.reference_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        else:
+            self.register_parameter("reference_type_embedding", None)
         self.t_embedder = TimestepConditioner(hidden_size)
         self.y_embedder = PatchTokenEmbedder(self.txt_embed_dim, hidden_size, bias=True, norm_layer=RMSNorm)
         self.y_pos_embedding = nn.Parameter(torch.randn(1, self.txt_max_length, hidden_size))
@@ -221,13 +262,34 @@ class PixDiT_T2I(nn.Module):
 
         self.initialize_weights()
 
-    def fetch_pos(self, height, width, device):
-        if (height, width) in self.precompute_pos:
-            return self.precompute_pos[(height, width)].to(device)
+    def fetch_pos(self, height, width, device, offset=(0.0, 0.0)):
+        key = (height, width, float(offset[0]), float(offset[1]))
+        if key in self.precompute_pos:
+            return self.precompute_pos[key].to(device)
         else:
-            pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width).to(device)
-            self.precompute_pos[(height, width)] = pos
+            pos = precompute_freqs_cis_2d(
+                self.hidden_size // self.num_groups,
+                height,
+                width,
+                offset=offset,
+            ).to(device)
+            self.precompute_pos[key] = pos
             return pos
+
+    def _sequence_positions(self, height, width, device):
+        target_pos = self.fetch_pos(height, width, device)
+        if self.sequence_rope_mode == "aligned":
+            reference_pos = target_pos
+        else:
+            if self.sequence_rope_offset is None:
+                # PixelDiT uses [0, 16] (inclusive). Move the second grid by
+                # one complete grid plus one grid step so no columns overlap.
+                step = 16.0 / max(width - 1, 1)
+                x_offset = 16.0 + step
+            else:
+                x_offset = self.sequence_rope_offset
+            reference_pos = self.fetch_pos(height, width, device, offset=(0.0, x_offset))
+        return torch.cat([target_pos, reference_pos], dim=0)
 
     def fetch_pos_text(self, length, device):
         if length in self.precompute_pos_txt:
@@ -249,14 +311,43 @@ class PixDiT_T2I(nn.Module):
         nn.init.zeros_(self.final_layer.linear.weight)
         nn.init.zeros_(self.final_layer.linear.bias)
 
-    def forward(self, x, t, y, s=None, mask=None):
+    def forward(self, x, t, y, condition_image=None, s=None, mask=None):
         B, _, H, W = x.shape
+        if H % self.patch_size or W % self.patch_size:
+            raise ValueError(
+                f"Image size {(H, W)} must be divisible by patch_size={self.patch_size}"
+            )
         Hs = H // self.patch_size
         Ws = W // self.patch_size
         L = Hs * Ws
 
-        pos = self.fetch_pos(Hs, Ws, x.device)
+        if self.conditioning_mode != "none":
+            if condition_image is None:
+                raise ValueError(
+                    f"condition_image is required for conditioning_mode={self.conditioning_mode!r}"
+                )
+            if condition_image.dim() != 4:
+                raise ValueError("condition_image must have shape [B, 3, H, W]")
+            if condition_image.shape != x.shape:
+                raise ValueError(
+                    f"condition_image shape {tuple(condition_image.shape)} must match "
+                    f"the noisy target shape {tuple(x.shape)}"
+                )
+            condition_image = condition_image.to(device=x.device, dtype=x.dtype)
+
+        pos = (
+            self._sequence_positions(Hs, Ws, x.device)
+            if self.conditioning_mode == "sequence"
+            else self.fetch_pos(Hs, Ws, x.device)
+        )
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        condition_patches = None
+        if condition_image is not None and self.conditioning_mode in {"patch", "both", "sequence"}:
+            condition_patches = torch.nn.functional.unfold(
+                condition_image,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+            ).transpose(1, 2)
 
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
@@ -267,10 +358,21 @@ class PixDiT_T2I(nn.Module):
         y_emb = self.y_embedder(y).view(B, Ltxt, self.hidden_size)
         y_emb = y_emb + self.y_pos_embedding[:, :Ltxt, :].to(y_emb.dtype)
 
-        condition = torch.nn.functional.silu(t_emb)
+        time_condition = torch.nn.functional.silu(t_emb)
 
         if s is None:
-            s0 = self.s_embedder(x_patches)
+            if self.conditioning_mode in {"patch", "both"}:
+                s0 = self.s_embedder(torch.cat([x_patches, condition_patches], dim=-1))
+            elif self.conditioning_mode == "sequence":
+                target_tokens = self.s_embedder(x_patches)
+                reference_tokens = self.s_embedder(condition_patches)
+                if self.reference_type_embedding is not None:
+                    reference_tokens = reference_tokens + self.reference_type_embedding.to(
+                        dtype=reference_tokens.dtype
+                    )
+                s0 = torch.cat([target_tokens, reference_tokens], dim=1)
+            else:
+                s0 = self.s_embedder(x_patches)
             pos_txt = self.fetch_pos_text(Ltxt, x.device) if self.use_text_rope else None
             attn_mask_joint = None
             if mask is not None and isinstance(mask, torch.Tensor):
@@ -281,17 +383,42 @@ class PixDiT_T2I(nn.Module):
                     m = m.squeeze(1)
                 if m.dim() == 2:
                     pad = (m == 0)
-                    pad_img = torch.zeros((B, L), dtype=torch.bool, device=x.device)
-                    attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(B, 1, 1, Ltxt + L)
+                    image_length = 2 * L if self.conditioning_mode == "sequence" else L
+                    pad_img = torch.zeros((B, image_length), dtype=torch.bool, device=x.device)
+                    attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
+                        B, 1, 1, Ltxt + image_length
+                    )
             self.last_repa_tokens = None
             s = s0
+            use_checkpoint = self.training and bool(getattr(self, "grad_checkpointing", False))
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint)
+                if use_checkpoint:
+                    s, y_emb = checkpoint(
+                        self.patch_blocks[i],
+                        s,
+                        y_emb,
+                        time_condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                        use_reentrant=False,
+                    )
+                else:
+                    s, y_emb = self.patch_blocks[i](
+                        s,
+                        y_emb,
+                        time_condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                    )
                 if 0 < self.repa_encoder_index == (i + 1):
-                    self.last_repa_tokens = s
+                    self.last_repa_tokens = s[:, :L, :]
             s = torch.nn.functional.silu(t_emb + s)
+            if self.conditioning_mode == "sequence":
+                s = s[:, :L, :]
         if not (0 < self.repa_encoder_index <= self.patch_depth):
-            self.last_repa_tokens = s
+            self.last_repa_tokens = s[:, :L, :]
 
         batch_size, length, _ = s.shape
         if length != L:
@@ -302,10 +429,34 @@ class PixDiT_T2I(nn.Module):
                 s = torch.cat([s, s.new_zeros(B, pad_len, s.shape[2])], dim=1)
             length = L
 
-        s_cond = s.view(B * L, self.hidden_size)
-        x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
+        # Sequence mode slices the target half from a larger token tensor;
+        # reshape also handles that intentionally non-contiguous view.
+        s_cond = s.reshape(B * L, self.hidden_size)
+        pixel_inputs = (
+            torch.cat([x, condition_image], dim=1)
+            if self.conditioning_mode in {"pixel", "both"}
+            else x
+        )
+        x_pixels = self.pixel_embedder(
+            pixel_inputs,
+            img_height=H,
+            img_width=W,
+            patch_size=self.patch_size,
+        )
         for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+            if self.training and bool(getattr(self, "grad_checkpointing", False)):
+                x_pixels = checkpoint(
+                    blk,
+                    x_pixels,
+                    s_cond,
+                    H,
+                    W,
+                    self.patch_size,
+                    mask,
+                    use_reentrant=False,
+                )
+            else:
+                x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels

@@ -1,10 +1,10 @@
 lightning==2.5.0.post0
 omegaconf==2.3.0
-torch==2.5.0
+# torch==2.5.0
 diffusers==0.30.0
 transformers==5.1.0
 jsonargparse[signatures]==4.27.7
-torchvision
+# torchvision
 timm
 accelerate
 gradio
