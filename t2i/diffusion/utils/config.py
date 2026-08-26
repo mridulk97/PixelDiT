@@ -167,6 +167,16 @@ class TrainingConfig(BaseConfig):
     use_fsdp: bool = False
     use_flash_attn: bool = False
     eval_sampling_steps: int = 250
+    # Trimap-band matting losses. Whole-image MSE gives the boundary band less
+    # than a tenth of the gradient once the silhouette is right, and that band
+    # is where ~96% of the remaining error lives.
+    matting_band_loss_weight: float = 0.0  # 0 disables the term entirely
+    matting_band_sad_weight: float = 1.0
+    matting_band_mse_weight: float = 1.0
+    matting_band_grad_weight: float = 1.0
+    matting_band_radius_min: int = 10
+    matting_band_radius_max: int = 40
+    matting_band_warmup_steps: int = 0
     lora_rank: int = 4
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0

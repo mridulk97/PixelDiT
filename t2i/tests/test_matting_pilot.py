@@ -27,7 +27,13 @@ from diffusion.model.lora import (
 from diffusion.model.trainer import PixDiTTrainer
 from diffusion.utils.matting_metrics import compute_matting_metrics
 from pixdit_core.pixeldit_t2i import PixDiT_T2I
+from diffusion.model.matting_losses import (
+    alpha_from_model_space,
+    matting_band_loss,
+    unknown_band,
+)
 from train_matting import (
+    _band_loss_scale,
     _decode_deterministic,
     _deterministic_inputs,
     _flow_loss,
@@ -276,7 +282,7 @@ class DeterministicFlowTests(unittest.TestCase):
             "y": torch.randn(2, 5, 16),
             "condition_image": torch.randn(2, 3, 4, 4),
         }
-        loss = _flow_loss(model, None, target, kwargs, self._config(True))
+        loss, _ = _flow_loss(model, None, target, kwargs, self._config(True))
         x_t, timesteps = _deterministic_inputs(target, 1000)
         with torch.no_grad():
             expected_output = model(x_t, timesteps, **kwargs)["x"]
@@ -316,7 +322,7 @@ class DeterministicFlowTests(unittest.TestCase):
         }
         timesteps = torch.tensor([250], dtype=torch.long)
         noise = torch.randn_like(target)
-        loss = _flow_loss(
+        loss, _ = _flow_loss(
             model, flow_matching, target, kwargs, self._config(False),
             timesteps=timesteps, noise=noise,
         )
@@ -495,6 +501,126 @@ class LoRATests(unittest.TestCase):
             self.assertTrue(torch.equal(first, restored))
 
 
+class BandLossTests(unittest.TestCase):
+    """Trimap-band losses: the term that targets where the error actually is."""
+
+    @staticmethod
+    def _disc(size=64, radius=20, soft=0):
+        """A soft-edged disc as a stand-in for an alpha matte."""
+        coords = torch.arange(size, dtype=torch.float32) - size / 2
+        distance = (coords[:, None] ** 2 + coords[None, :] ** 2).sqrt()
+        if soft:
+            alpha = ((radius + soft - distance) / (2 * soft)).clamp(0, 1)
+        else:
+            alpha = (distance <= radius).float()
+        return alpha[None, None]
+
+    def test_band_hugs_the_boundary_and_excludes_flat_regions(self):
+        alpha = self._disc()
+        band = unknown_band(alpha, radius=5)
+        self.assertEqual(band.shape, alpha.shape)
+        # Centre and far corner are unambiguous, so neither may be in the band.
+        self.assertEqual(band[0, 0, 32, 32].item(), 0.0)
+        self.assertEqual(band[0, 0, 0, 0].item(), 0.0)
+        self.assertGreater(band.mean().item(), 0.0)
+        # A wider dilation must cover strictly more.
+        self.assertGreater(unknown_band(alpha, 10).mean(), band.mean())
+
+    def test_uniform_matte_has_an_empty_band_and_no_nan(self):
+        for value in (0.0, 1.0):
+            with self.subTest(value=value):
+                images = torch.full((1, 3, 32, 32), value * 2 - 1)
+                self.assertEqual(unknown_band(alpha_from_model_space(images), 4).sum().item(), 0.0)
+                loss, _ = matting_band_loss(images, images, radius=4)
+                self.assertEqual(loss.item(), 0.0)
+                self.assertFalse(torch.isnan(loss))
+
+    def test_perfect_prediction_is_exactly_zero(self):
+        target = self._disc(soft=3).repeat(1, 3, 1, 1) * 2 - 1
+        loss, terms = matting_band_loss(target, target, radius=8)
+        self.assertEqual(loss.item(), 0.0)
+        for name in ("sad", "mse", "grad"):
+            self.assertEqual(terms[name].item(), 0.0, name)
+
+    def test_worse_prediction_scores_higher(self):
+        target = self._disc(soft=3).repeat(1, 3, 1, 1) * 2 - 1
+        close = (target + 0.05 * torch.randn_like(target)).clamp(-1, 1)
+        far = self._disc(radius=14, soft=3).repeat(1, 3, 1, 1) * 2 - 1
+        self.assertLess(
+            matting_band_loss(close, target, radius=8)[0].item(),
+            matting_band_loss(far, target, radius=8)[0].item(),
+        )
+
+    def test_gradient_reaches_the_prediction_but_not_the_band(self):
+        target = self._disc(soft=3).repeat(1, 3, 1, 1) * 2 - 1
+        prediction = (target + 0.1).clone().requires_grad_(True)
+        loss, _ = matting_band_loss(prediction, target, radius=8)
+        loss.backward()
+        self.assertIsNotNone(prediction.grad)
+        self.assertTrue(torch.any(prediction.grad != 0))
+        # The band is derived from the target under no_grad, so a model cannot
+        # widen it to make its own job easier.
+        self.assertFalse(unknown_band(alpha_from_model_space(target), 8).requires_grad)
+
+    def test_terms_are_resolution_independent(self):
+        """Band means, unlike a fixed /1000, must not move with image size."""
+        small = self._disc(size=64, radius=20, soft=3)
+        large = torch.nn.functional.interpolate(
+            small, scale_factor=2, mode="bilinear", align_corners=False
+        )
+        def score(alpha, radius):
+            target = alpha.repeat(1, 3, 1, 1) * 2 - 1
+            prediction = (target * 0.8).clamp(-1, 1)
+            return matting_band_loss(prediction, target, radius=radius)[0].item()
+        # Radius scales with the image so the band covers the same structure.
+        self.assertAlmostEqual(score(small, 5), score(large, 10), delta=0.02)
+
+    def test_warmup_ramps_the_band_weight(self):
+        config = SimpleNamespace(
+            train=SimpleNamespace(matting_band_loss_weight=2.0, matting_band_warmup_steps=100)
+        )
+        self.assertEqual(_band_loss_scale(config, 0), 0.0)
+        self.assertAlmostEqual(_band_loss_scale(config, 50), 1.0)
+        self.assertEqual(_band_loss_scale(config, 100), 2.0)
+        self.assertEqual(_band_loss_scale(config, 500), 2.0)
+        config.train.matting_band_warmup_steps = 0
+        self.assertEqual(_band_loss_scale(config, 0), 2.0)
+        config.train.matting_band_loss_weight = 0.0
+        self.assertEqual(_band_loss_scale(config, 500), 0.0)
+
+    def test_flow_loss_adds_the_band_term_and_reports_components(self):
+        torch.manual_seed(11)
+        model = TinyWrapper("both")
+        nn.init.normal_(model.core.final_layer.linear.weight, std=0.02)
+        target = torch.randn(1, 3, 8, 8).clamp(-1, 1)
+        kwargs = {"y": torch.randn(1, 5, 16), "condition_image": torch.randn(1, 3, 8, 8)}
+        config = SimpleNamespace(
+            scheduler=SimpleNamespace(deterministic_flow=True, train_sampling_steps=1000),
+            train=SimpleNamespace(
+                matting_band_sad_weight=1.0,
+                matting_band_mse_weight=1.0,
+                matting_band_grad_weight=1.0,
+                matting_band_radius_min=2,
+                matting_band_radius_max=2,
+            ),
+        )
+        base, base_parts = _flow_loss(model, None, target, kwargs, config, band_scale=0.0)
+        total, parts = _flow_loss(model, None, target, kwargs, config, band_scale=1.0)
+        self.assertEqual(set(base_parts), {"base"})
+        for name in ("base", "band_sad", "band_mse", "band_grad", "band_total", "band_fraction"):
+            self.assertIn(name, parts)
+        self.assertAlmostEqual(base.item(), parts["base"].item(), places=5)
+        self.assertGreater(total.item(), base.item())
+
+    def test_band_term_requires_deterministic_flow(self):
+        config = SimpleNamespace(
+            scheduler=SimpleNamespace(deterministic_flow=False, train_sampling_steps=1000),
+            train=SimpleNamespace(),
+        )
+        with self.assertRaisesRegex(ValueError, "deterministic_flow"):
+            _flow_loss(TinyWrapper("both"), None, torch.randn(1, 3, 4, 4), {}, config, band_scale=1.0)
+
+
 class DataAndMetricTests(unittest.TestCase):
     def test_am2k_pairing_preprocessing_and_subset(self):
         root = Path("/scratch/mridul/data/matting/am-2k")
@@ -520,11 +646,36 @@ class DataAndMetricTests(unittest.TestCase):
         self.assertEqual(data_info["sample_id"], dataset.dataset[0]["sample_id"])
         self.assertTrue(prompt.startswith("Transform to matting map"))
 
+    def test_band_metrics_isolate_the_boundary(self):
+        """Whole-image metrics stay flattering while band metrics do not."""
+        from diffusion.utils.matting_metrics import compute_matting_metrics
+
+        size = 64
+        coords = np.arange(size, dtype=np.float32) - size / 2
+        distance = np.sqrt(coords[:, None] ** 2 + coords[None, :] ** 2)
+        target = (distance <= 20).astype(np.float32)
+        # Error confined to a ring around the boundary: a blurred edge.
+        prediction = np.clip((24 - distance) / 8.0, 0.0, 1.0).astype(np.float32)
+        values = compute_matting_metrics(prediction, target, band_radius=6)
+        self.assertLess(values["band_fraction"], 0.5)
+        self.assertGreater(values["band_error_share"], 0.9)
+        self.assertGreater(values["band_mse"], values["mse"])
+        exact = compute_matting_metrics(target, target, band_radius=6)
+        self.assertEqual(exact["band_mse"], 0.0)
+        self.assertEqual(exact["band_sad"], 0.0)
+
     def test_matting_metrics(self):
         target = np.zeros((12, 12), dtype=np.float32)
         target[3:9, 3:9] = 1.0
         perfect = compute_matting_metrics(target, target)
-        self.assertTrue(all(value == 0.0 for value in perfect.values()))
+        descriptors = {"band_fraction", "band_error_share"}
+        self.assertTrue(
+            all(value == 0.0 for name, value in perfect.items() if name not in descriptors),
+            perfect,
+        )
+        # The band itself is a property of the target, so it is non-empty even
+        # when the prediction is exact.
+        self.assertGreater(perfect["band_fraction"], 0.0)
         wrong = compute_matting_metrics(np.zeros_like(target), target)
         self.assertGreater(wrong["sad"], 0.0)
         self.assertGreater(wrong["mse"], 0.0)
