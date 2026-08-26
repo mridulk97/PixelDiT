@@ -34,6 +34,7 @@ from diffusion.model.matting_losses import (
 )
 from train_matting import (
     _band_loss_scale,
+    _fires_on,
     _decode_deterministic,
     _deterministic_inputs,
     _flow_loss,
@@ -574,6 +575,27 @@ class BandLossTests(unittest.TestCase):
             return matting_band_loss(prediction, target, radius=radius)[0].item()
         # Radius scales with the image so the band covers the same structure.
         self.assertAlmostEqual(score(small, 5), score(large, 10), delta=0.02)
+
+    def test_periodic_cadences_are_independent(self):
+        """Preview and checkpoint intervals must not gate each other.
+
+        They used to: the preview block lived inside the checkpoint branch, so
+        wandb_image_interval=50 with adapter_save_steps=100 produced previews
+        every 100 steps and the finer setting did nothing.
+        """
+        save_every, image_every, max_steps = 100, 50, 1000
+        previews = [s for s in range(1, max_steps + 1) if _fires_on(s, image_every, max_steps)]
+        saves = [s for s in range(1, max_steps + 1) if _fires_on(s, save_every, max_steps)]
+        self.assertEqual(previews[:4], [50, 100, 150, 200])
+        self.assertEqual(saves[:4], [100, 200, 300, 400])
+        self.assertEqual(len(previews), 2 * len(saves))
+
+    def test_fires_on_always_includes_the_final_step(self):
+        self.assertTrue(_fires_on(777, 100, 777))
+        self.assertFalse(_fires_on(777, 100, 1000))
+        self.assertTrue(_fires_on(300, 100, 1000))
+        # A non-positive interval must clamp rather than divide by zero.
+        self.assertTrue(_fires_on(7, 0, 1000))
 
     def test_warmup_ramps_the_band_weight(self):
         config = SimpleNamespace(
