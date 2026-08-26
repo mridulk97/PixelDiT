@@ -19,6 +19,7 @@ model:
   multi_scale: false
   class_dropout_prob: 0.0
   conditioning_mode: both
+  conditioning_proj_init: zero
   sequence_rope_mode: aligned
   sequence_rope_offset:
   use_sequence_type_embedding: true
@@ -51,6 +52,10 @@ scheduler:
   pred_sigma: false
   learn_sigma: false
   flow_shift: 4.0
+  # Zero input at the top of the schedule, single-step decode. Removes the
+  # denoising shortcut that let earlier runs reach low loss while ignoring the
+  # conditioning image. Set false to reproduce the stochastic-flow runs.
+  deterministic_flow: true
   weighting_scheme: logit_normal
   logit_mean: 0.0
   logit_std: 1.0

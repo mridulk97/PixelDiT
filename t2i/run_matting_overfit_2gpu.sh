@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${1:?Usage: bash run_matting_overfit_2gpu.sh patch|pixel|both|sequence [extra pyrallis arguments]}"
+mode="${1:?Usage: bash run_matting_overfit_2gpu.sh patch|pixel|both|sequence|sequence_pixel [extra pyrallis arguments]}"
 shift
 case "$mode" in
-  patch|pixel|both|sequence) ;;
+  patch|pixel|both|sequence|sequence_pixel) ;;
   *)
     echo "Unsupported conditioning mode: $mode" >&2
     exit 2

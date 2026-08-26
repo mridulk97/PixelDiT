@@ -27,7 +27,13 @@ from diffusion.model.lora import (
 from diffusion.model.trainer import PixDiTTrainer
 from diffusion.utils.matting_metrics import compute_matting_metrics
 from pixdit_core.pixeldit_t2i import PixDiT_T2I
-from train_matting import _sample_training_grid, _validation_losses
+from train_matting import (
+    _decode_deterministic,
+    _deterministic_inputs,
+    _flow_loss,
+    _sample_training_grid,
+    _validation_losses,
+)
 
 
 def tiny_core(mode="none", rope_mode="aligned"):
@@ -78,6 +84,7 @@ class ConditioningTests(unittest.TestCase):
             "pixel": (12, 6),
             "both": (24, 6),
             "sequence": (12, 3),
+            "sequence_pixel": (12, 6),
         }
         for mode, widths in expected.items():
             with self.subTest(mode=mode):
@@ -128,10 +135,11 @@ class ConditioningTests(unittest.TestCase):
 
 class InitializationTests(unittest.TestCase):
     @staticmethod
-    def _trainer(mode):
+    def _trainer(mode, proj_init="zero"):
         config = SimpleNamespace(
             model=SimpleNamespace(
                 conditioning_mode=mode,
+                conditioning_proj_init=proj_init,
                 sequence_rope_mode="aligned",
                 sequence_rope_offset=None,
                 use_sequence_type_embedding=True,
@@ -156,7 +164,7 @@ class InitializationTests(unittest.TestCase):
             },
         )
 
-    def test_channel_concat_uses_symmetric_sqrt2_expansion(self):
+    def test_channel_concat_zero_init_preserves_pretrained_projection(self):
         torch.manual_seed(11)
         base = self._trainer("none")
         state = base.state_dict()
@@ -166,11 +174,36 @@ class InitializationTests(unittest.TestCase):
         for key in ("core.s_embedder.proj.weight", "core.pixel_embedder.proj.weight"):
             old = state[key]
             new = widened.state_dict()[key]
-            self.assertTrue(torch.equal(new[:, : old.shape[1]], old / np.sqrt(2.0)))
-            self.assertTrue(torch.equal(new[:, old.shape[1] :], old / np.sqrt(2.0)))
+            self.assertTrue(torch.equal(new[:, : old.shape[1]], old))
+            self.assertTrue(torch.count_nonzero(new[:, old.shape[1] :]) == 0)
         self.assertTrue(
             torch.equal(widened.core.s_embedder.proj.bias, state["core.s_embedder.proj.bias"])
         )
+
+    def test_zero_init_widening_matches_the_unconditioned_projection(self):
+        """The widened layer must compute exactly Wx at initialization."""
+        torch.manual_seed(12)
+        base = self._trainer("none")
+        state = base.state_dict()
+        widened = self._trainer("both")
+        widened.load_state_dict(state, strict=False)
+        patches = torch.randn(2, 4, 12)
+        condition = torch.randn(2, 4, 12)
+        reference = base.core.s_embedder(patches)
+        conditioned = widened.core.s_embedder(torch.cat([patches, condition], dim=-1))
+        self.assertTrue(torch.allclose(reference, conditioned, atol=1e-6))
+
+    def test_balanced_init_reproduces_the_legacy_sqrt2_expansion(self):
+        torch.manual_seed(11)
+        base = self._trainer("none")
+        state = base.state_dict()
+        widened = self._trainer("both", proj_init="balanced")
+        widened.load_state_dict(state, strict=False)
+        for key in ("core.s_embedder.proj.weight", "core.pixel_embedder.proj.weight"):
+            old = state[key]
+            new = widened.state_dict()[key]
+            self.assertTrue(torch.equal(new[:, : old.shape[1]], old / np.sqrt(2.0)))
+            self.assertTrue(torch.equal(new[:, old.shape[1] :], old / np.sqrt(2.0)))
 
     def test_sequence_projection_is_unchanged_and_shared(self):
         torch.manual_seed(13)
@@ -179,30 +212,158 @@ class InitializationTests(unittest.TestCase):
         sequence = self._trainer("sequence")
         result = sequence.load_state_dict(state, strict=False)
         self.assertEqual(result.unexpected_keys, [])
-        self.assertEqual(result.missing_keys, ["core.reference_type_embedding"])
+        self.assertEqual(
+            sorted(result.missing_keys),
+            ["core.reference_type_embedding", "core.target_type_embedding"],
+        )
         self.assertTrue(torch.equal(sequence.core.s_embedder.proj.weight, state["core.s_embedder.proj.weight"]))
         self.assertEqual(sequence.core.s_embedder.proj.in_features, 12)
-        self.assertTrue(torch.count_nonzero(sequence.core.reference_type_embedding) == 0)
+
+    def test_sequence_type_embeddings_break_the_stream_symmetry(self):
+        """Aligned RoPE leaves these as the only target/reference distinction."""
+        for mode in ("sequence", "sequence_pixel"):
+            with self.subTest(mode=mode):
+                core = self._trainer(mode).core
+                self.assertIsNotNone(core.target_type_embedding)
+                self.assertIsNotNone(core.reference_type_embedding)
+                self.assertTrue(torch.count_nonzero(core.target_type_embedding) > 0)
+                self.assertTrue(torch.count_nonzero(core.reference_type_embedding) > 0)
+                self.assertFalse(
+                    torch.equal(core.target_type_embedding, core.reference_type_embedding)
+                )
+
+    def test_sequence_pixel_widens_only_the_pixel_projection(self):
+        torch.manual_seed(15)
+        base = self._trainer("none")
+        state = base.state_dict()
+        model = self._trainer("sequence_pixel")
+        model.load_state_dict(state, strict=False)
+        self.assertEqual(model.core.s_embedder.proj.in_features, 12)
+        self.assertEqual(model.core.pixel_embedder.proj.in_features, 6)
+        old = state["core.pixel_embedder.proj.weight"]
+        new = model.state_dict()["core.pixel_embedder.proj.weight"]
+        self.assertTrue(torch.equal(new[:, : old.shape[1]], old))
+        self.assertTrue(torch.count_nonzero(new[:, old.shape[1] :]) == 0)
+
+
+class DeterministicFlowTests(unittest.TestCase):
+    """The deterministic regime must give the model no view of the target."""
+
+    @staticmethod
+    def _config(deterministic):
+        return SimpleNamespace(
+            scheduler=SimpleNamespace(
+                deterministic_flow=deterministic,
+                train_sampling_steps=1000,
+            )
+        )
+
+    def test_model_input_carries_no_trace_of_the_target(self):
+        target = torch.randn(2, 3, 4, 4)
+        x_t, timesteps = _deterministic_inputs(target, 1000)
+        self.assertEqual(x_t.shape, target.shape)
+        # Exactly zero, not merely small: a scaled copy of the target is still
+        # the target, and normalization layers can undo an attenuation.
+        self.assertEqual(torch.count_nonzero(x_t).item(), 0)
+        self.assertTrue(torch.equal(timesteps, torch.full((2,), 999, dtype=torch.long)))
+
+    def test_loss_is_the_single_step_regression_to_minus_target(self):
+        torch.manual_seed(3)
+        model = TinyWrapper("both")
+        nn.init.normal_(model.core.final_layer.linear.weight, std=0.02)
+        target = torch.randn(2, 3, 4, 4)
+        kwargs = {
+            "y": torch.randn(2, 5, 16),
+            "condition_image": torch.randn(2, 3, 4, 4),
+        }
+        loss = _flow_loss(model, None, target, kwargs, self._config(True))
+        x_t, timesteps = _deterministic_inputs(target, 1000)
+        with torch.no_grad():
+            expected_output = model(x_t, timesteps, **kwargs)["x"]
+        expected = ((expected_output.float() + target.float()) ** 2).mean()
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
+
+    def test_decode_inverts_the_training_target(self):
+        """A model that predicts the target exactly must decode to it."""
+        class NegateTarget(nn.Module):
+            def __init__(self, value):
+                super().__init__()
+                self.value = value
+
+            def forward(self, x, timestep, **_kwargs):
+                return {"x": -self.value}
+
+        target = torch.randn(2, 3, 4, 4)
+        decoded = _decode_deterministic(NegateTarget(target), target, {}, 1000)
+        self.assertTrue(torch.equal(decoded, target))
+
+    def test_loss_falls_back_to_the_stochastic_path(self):
+        torch.manual_seed(5)
+        model = TinyWrapper("both")
+        nn.init.normal_(model.core.final_layer.linear.weight, std=0.02)
+        flow_matching = Scheduler(
+            "1000",
+            noise_schedule="linear_flow",
+            predict_flow_v=True,
+            learn_sigma=False,
+            pred_sigma=False,
+            flow_shift=4.0,
+        )
+        target = torch.randn(1, 3, 4, 4)
+        kwargs = {
+            "y": torch.randn(1, 5, 16),
+            "condition_image": torch.randn(1, 3, 4, 4),
+        }
+        timesteps = torch.tensor([250], dtype=torch.long)
+        noise = torch.randn_like(target)
+        loss = _flow_loss(
+            model, flow_matching, target, kwargs, self._config(False),
+            timesteps=timesteps, noise=noise,
+        )
+        expected = flow_matching.training_losses(
+            model, target, timesteps, noise=noise, model_kwargs=kwargs
+        )["loss"].mean()
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
+
+    def test_deterministic_decode_depends_on_the_condition(self):
+        """With a zero input the condition is the only source of information."""
+        torch.manual_seed(7)
+        for mode in ("both", "sequence", "sequence_pixel"):
+            with self.subTest(mode=mode):
+                model = TinyWrapper(mode).eval()
+                nn.init.normal_(model.core.final_layer.linear.weight, std=0.02)
+                target = torch.randn(1, 3, 4, 4)
+                y = torch.randn(1, 5, 16)
+                first = _decode_deterministic(
+                    model, target, {"y": y, "condition_image": torch.randn(1, 3, 4, 4)}, 1000
+                )
+                second = _decode_deterministic(
+                    model, target, {"y": y, "condition_image": torch.randn(1, 3, 4, 4)}, 1000
+                )
+                self.assertTrue((first - second).abs().max().item() > 1e-8)
 
 
 class LoRATests(unittest.TestCase):
     def test_generated_triplet_grid(self):
-        model = TinyWrapper("both")
-        target = torch.randn(1, 3, 4, 4).clamp(-1, 1)
-        condition = torch.randn_like(target).clamp(-1, 1)
-        batch = (target, None, None, None, None, None, None, None, condition)
-        grid, generated_mse = _sample_training_grid(
-            model,
-            batch,
-            torch.randn(1, 5, 16),
-            torch.ones(1, 5),
-            sample_steps=2,
-            flow_shift=4.0,
-            num_examples=1,
-        )
-        self.assertEqual(grid.shape[0], 3)
-        self.assertGreater(grid.shape[2], 3 * target.shape[-1])
-        self.assertTrue(np.isfinite(generated_mse))
+        for deterministic in (False, True):
+            with self.subTest(deterministic_flow=deterministic):
+                model = TinyWrapper("both")
+                target = torch.randn(1, 3, 4, 4).clamp(-1, 1)
+                condition = torch.randn_like(target).clamp(-1, 1)
+                batch = (target, None, None, None, None, None, None, None, condition)
+                grid, generated_mse = _sample_training_grid(
+                    model,
+                    batch,
+                    torch.randn(1, 5, 16),
+                    torch.ones(1, 5),
+                    sample_steps=2,
+                    flow_shift=4.0,
+                    num_examples=1,
+                    config=DeterministicFlowTests._config(deterministic),
+                )
+                self.assertEqual(grid.shape[0], 3)
+                self.assertGreater(grid.shape[2], 3 * target.shape[-1])
+                self.assertTrue(np.isfinite(generated_mse))
 
     def test_validation_is_condition_shuffled_at_batch_one_memory(self):
         model = TinyWrapper("both")
@@ -218,17 +379,20 @@ class LoRATests(unittest.TestCase):
             pred_sigma=False,
             flow_shift=4.0,
         )
-        correct, shuffled = _validation_losses(
-            model,
-            flow_matching,
-            batch,
-            torch.randn(1, 5, 16),
-            torch.ones(1, 5),
-            1000,
-        )
-        self.assertTrue(torch.isfinite(correct))
-        self.assertTrue(torch.isfinite(shuffled))
-        self.assertTrue(model.training)
+        for deterministic in (False, True):
+            with self.subTest(deterministic_flow=deterministic):
+                model.train()
+                correct, shuffled = _validation_losses(
+                    model,
+                    flow_matching,
+                    batch,
+                    torch.randn(1, 5, 16),
+                    torch.ones(1, 5),
+                    DeterministicFlowTests._config(deterministic),
+                )
+                self.assertTrue(torch.isfinite(correct))
+                self.assertTrue(torch.isfinite(shuffled))
+                self.assertTrue(model.training)
 
     def test_small_forward_backward_for_channel_and_sequence_paths(self):
         x = torch.randn(1, 3, 4, 4)
@@ -243,11 +407,11 @@ class LoRATests(unittest.TestCase):
             pred_sigma=False,
             flow_shift=4.0,
         )
-        for mode in ("patch", "pixel", "both", "sequence"):
+        for mode in ("patch", "pixel", "both", "sequence", "sequence_pixel"):
             with self.subTest(mode=mode):
                 model = TinyWrapper(mode)
                 configure_matting_trainable_parameters(model, rank=2, alpha=2, dropout=0)
-                model.core.grad_checkpointing = mode == "sequence"
+                model.core.grad_checkpointing = mode.startswith("sequence")
                 nn.init.normal_(model.core.final_layer.linear.weight, std=0.02)
                 loss = flow_matching.training_losses(
                     model,
@@ -264,6 +428,28 @@ class LoRATests(unittest.TestCase):
                 self.assertTrue(
                     any(gradient is not None and torch.any(gradient != 0) for gradient in gradients)
                 )
+
+    def test_frozen_and_trainable_input_projections_per_mode(self):
+        expectations = {
+            "patch": {"s_embedder": True, "pixel_embedder": False, "type_embeddings": False},
+            "pixel": {"s_embedder": False, "pixel_embedder": True, "type_embeddings": False},
+            "both": {"s_embedder": True, "pixel_embedder": True, "type_embeddings": False},
+            "sequence": {"s_embedder": False, "pixel_embedder": False, "type_embeddings": True},
+            "sequence_pixel": {"s_embedder": False, "pixel_embedder": True, "type_embeddings": True},
+        }
+        for mode, expected in expectations.items():
+            with self.subTest(mode=mode):
+                model = TinyWrapper(mode)
+                configure_matting_trainable_parameters(model, rank=2, alpha=2, dropout=0)
+                trainable = {name for name, value in model.named_parameters() if value.requires_grad}
+                self.assertEqual(
+                    "core.s_embedder.proj.weight" in trainable, expected["s_embedder"]
+                )
+                self.assertEqual(
+                    "core.pixel_embedder.proj.weight" in trainable, expected["pixel_embedder"]
+                )
+                for name in ("core.target_type_embedding", "core.reference_type_embedding"):
+                    self.assertEqual(name in trainable, expected["type_embeddings"], name)
 
     def test_trainable_modules_and_adapter_reload(self):
         torch.manual_seed(17)

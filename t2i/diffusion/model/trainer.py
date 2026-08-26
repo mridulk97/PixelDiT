@@ -84,6 +84,18 @@ class PixDiTTrainer(nn.Module):
                 extra.get("use_sequence_type_embedding", True),
             )
         )
+        self.conditioning_proj_init = str(
+            getattr(
+                model_config,
+                "conditioning_proj_init",
+                extra.get("conditioning_proj_init", "zero"),
+            )
+        ).lower()
+        if self.conditioning_proj_init not in {"zero", "balanced"}:
+            raise ValueError(
+                "conditioning_proj_init must be 'zero' or 'balanced', "
+                f"got {self.conditioning_proj_init!r}"
+            )
 
         if PixDiT_T2I is None:
             raise ImportError("Failed to import PixDiT_T2I from pixdit_core.pixeldit_t2i. Check repo layout and PYTHONPATH.")
@@ -129,7 +141,19 @@ class PixDiTTrainer(nn.Module):
         )
 
     def _adapt_conditioning_input_weights(self, state_dict):
-        """Expand pretrained input projections for channel-concat modes."""
+        """Expand pretrained input projections for channel-concat modes.
+
+        ``zero`` (default) keeps the widened projection functionally identical
+        to the pretrained one at initialization: the noisy-target half reuses
+        the pretrained columns and the condition half starts at zero, so the
+        conditioning pathway grows out of an intact base model the way a
+        zero-initialized LoRA branch does.
+
+        ``balanced`` restores the earlier ``[W/sqrt(2), W/sqrt(2)]`` split. It
+        preserves activation scale but not the function: the widened layer
+        computes ``W(x + c)/sqrt(2)`` while every downstream block was
+        pretrained on ``Wx``, so training first has to undo that.
+        """
         adapted = state_dict.copy()
         for key in (
             "core.s_embedder.proj.weight",
@@ -144,7 +168,10 @@ class PixDiTTrainer(nn.Module):
             if source.ndim != 2 or target.ndim != 2:
                 continue
             if target.shape[0] == source.shape[0] and target.shape[1] == 2 * source.shape[1]:
-                adapted[key] = torch.cat([source, source], dim=1) / (2.0 ** 0.5)
+                if self.conditioning_proj_init == "zero":
+                    adapted[key] = torch.cat([source, torch.zeros_like(source)], dim=1)
+                else:
+                    adapted[key] = torch.cat([source, source], dim=1) / (2.0 ** 0.5)
             else:
                 raise RuntimeError(
                     f"Cannot adapt pretrained projection {key}: checkpoint {tuple(source.shape)} "
