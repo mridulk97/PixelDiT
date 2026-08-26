@@ -88,6 +88,12 @@ def _deterministic_inputs(target, train_sampling_steps):
     return torch.zeros_like(target), timesteps
 
 
+def _fires_on(global_step, interval, max_steps):
+    """Whether a periodic action runs at this step. The final step always fires."""
+    interval = max(1, int(interval))
+    return global_step % interval == 0 or global_step == max_steps
+
+
 def _band_loss_scale(config, global_step):
     """Weight on the band term, linearly warmed up over the configured steps."""
     weight = float(config.train.matting_band_loss_weight)
@@ -586,37 +592,43 @@ def main(config: PixDiTConfig) -> None:
             loss_accumulator.zero_()
             loss_microsteps = 0
 
-            should_save = global_step % save_every == 0 or global_step == max_steps
-            if should_save:
+            should_save = _fires_on(global_step, save_every, max_steps)
+            # Previews used to live inside the checkpoint branch, which meant
+            # wandb_image_interval only ever fired on multiples of
+            # adapter_save_steps -- setting it finer silently did nothing. The
+            # two cadences are independent now, and under deterministic flow a
+            # preview is a single forward pass, so a fine interval is cheap.
+            should_preview = config.train.wandb_log_images and _fires_on(
+                global_step, config.train.wandb_image_interval, max_steps
+            )
+            if should_save or should_preview:
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     unwrapped = accelerator.unwrap_model(model)
-                    correct, shuffled = _validation_losses(
-                        unwrapped,
-                        diffusion,
-                        validation_batch,
-                        prompt_embeddings,
-                        prompt_mask,
-                        config,
-                    )
-                    LOGGER.info(
-                        "validation step=%d correct_loss=%.6f shuffled_loss=%.6f",
-                        global_step,
-                        correct.item(),
-                        shuffled.item(),
-                    )
-                    validation_log = {
-                        "validation/correct_condition_flow_loss": correct.item(),
-                        "validation/shuffled_condition_flow_loss": shuffled.item(),
-                        "validation/condition_loss_gap": shuffled.item() - correct.item(),
-                    }
-                    image_interval = max(1, int(config.train.wandb_image_interval))
-                    should_log_images = (
-                        wandb_run is not None
-                        and config.train.wandb_log_images
-                        and (global_step % image_interval == 0 or global_step == max_steps)
-                    )
-                    if should_log_images:
+                    validation_log = {}
+                    if should_save:
+                        correct, shuffled = _validation_losses(
+                            unwrapped,
+                            diffusion,
+                            validation_batch,
+                            prompt_embeddings,
+                            prompt_mask,
+                            config,
+                        )
+                        LOGGER.info(
+                            "validation step=%d correct_loss=%.6f shuffled_loss=%.6f",
+                            global_step,
+                            correct.item(),
+                            shuffled.item(),
+                        )
+                        validation_log.update(
+                            {
+                                "validation/correct_condition_flow_loss": correct.item(),
+                                "validation/shuffled_condition_flow_loss": shuffled.item(),
+                                "validation/condition_loss_gap": shuffled.item() - correct.item(),
+                            }
+                        )
+                    if should_preview and wandb_run is not None:
                         try:
                             grid, generated_mse = _sample_training_grid(
                                 unwrapped,
@@ -644,39 +656,40 @@ def main(config: PixDiTConfig) -> None:
                             )
                             unwrapped.train()
                             torch.cuda.empty_cache()
-                    if wandb_run is not None:
+                    if wandb_run is not None and validation_log:
                         wandb_run.log(validation_log, step=global_step)
-                    adapter_dir = osp.join(config.work_dir, "adapters")
-                    adapter_path = osp.join(adapter_dir, f"step_{global_step}.pth")
-                    metadata = {
-                        **lora_info,
-                        "base_checkpoint": osp.abspath(base_checkpoint),
-                        "image_size": config.model.image_size,
-                        "patch_size": unwrapped.core.patch_size,
-                        "sequence_rope_mode": config.model.sequence_rope_mode,
-                        "sequence_rope_offset": config.model.sequence_rope_offset,
-                        "use_sequence_type_embedding": config.model.use_sequence_type_embedding,
-                        "conditioning_proj_init": config.model.conditioning_proj_init,
-                        "deterministic_flow": config.scheduler.deterministic_flow,
-                        "matting_band_loss_weight": config.train.matting_band_loss_weight,
-                        "prompt": prompt,
-                        "subset_sample_ids": [record["sample_id"] for record in subset_records],
-                        "run_name": config.name,
-                        "wandb_run_id": wandb_run.id if wandb_run is not None else None,
-                    }
-                    save_adapter_checkpoint(
-                        adapter_path,
-                        unwrapped,
-                        metadata,
-                        optimizer=optimizer,
-                        lr_scheduler=lr_scheduler,
-                        step=global_step,
-                        epoch=epoch,
-                    )
-                    latest = Path(adapter_dir) / "latest.pth"
-                    if latest.exists() or latest.is_symlink():
-                        latest.unlink()
-                    latest.symlink_to(Path(adapter_path).resolve())
+                    if should_save:
+                        adapter_dir = osp.join(config.work_dir, "adapters")
+                        adapter_path = osp.join(adapter_dir, f"step_{global_step}.pth")
+                        metadata = {
+                            **lora_info,
+                            "base_checkpoint": osp.abspath(base_checkpoint),
+                            "image_size": config.model.image_size,
+                            "patch_size": unwrapped.core.patch_size,
+                            "sequence_rope_mode": config.model.sequence_rope_mode,
+                            "sequence_rope_offset": config.model.sequence_rope_offset,
+                            "use_sequence_type_embedding": config.model.use_sequence_type_embedding,
+                            "conditioning_proj_init": config.model.conditioning_proj_init,
+                            "deterministic_flow": config.scheduler.deterministic_flow,
+                            "matting_band_loss_weight": config.train.matting_band_loss_weight,
+                            "prompt": prompt,
+                            "subset_sample_ids": [record["sample_id"] for record in subset_records],
+                            "run_name": config.name,
+                            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+                        }
+                        save_adapter_checkpoint(
+                            adapter_path,
+                            unwrapped,
+                            metadata,
+                            optimizer=optimizer,
+                            lr_scheduler=lr_scheduler,
+                            step=global_step,
+                            epoch=epoch,
+                        )
+                        latest = Path(adapter_dir) / "latest.pth"
+                        if latest.exists() or latest.is_symlink():
+                            latest.unlink()
+                        latest.symlink_to(Path(adapter_path).resolve())
                 accelerator.wait_for_everyone()
 
             if global_step >= max_steps:
