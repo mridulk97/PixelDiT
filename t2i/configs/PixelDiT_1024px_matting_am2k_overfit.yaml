@@ -86,7 +86,7 @@ train:
   adapter_save_steps: 100
   log_interval: 10
   wandb_log_images: true
-  wandb_image_interval: 50
+wandb_image_interval: 50
   wandb_sampling_steps: 20
   wandb_num_examples: 4
   repa_loss_weight: 0.0
