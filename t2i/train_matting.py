@@ -18,6 +18,7 @@ from torchvision.utils import make_grid, save_image
 from diffusion import DPMS, Scheduler
 from diffusion.data.builder import build_dataset
 from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder
+from diffusion.model.matting_losses import matting_band_loss, sample_band_radius
 from diffusion.model.lora import (
     configure_matting_trainable_parameters,
     load_adapter_checkpoint,
@@ -87,8 +88,34 @@ def _deterministic_inputs(target, train_sampling_steps):
     return torch.zeros_like(target), timesteps
 
 
-def _flow_loss(model, diffusion, target, model_kwargs, config, timesteps=None, noise=None):
-    """Flow-matching loss under either the stochastic or deterministic regime."""
+def _band_loss_scale(config, global_step):
+    """Weight on the band term, linearly warmed up over the configured steps."""
+    weight = float(config.train.matting_band_loss_weight)
+    if weight <= 0.0:
+        return 0.0
+    warmup = int(config.train.matting_band_warmup_steps)
+    if warmup <= 0:
+        return weight
+    # Edit2Perceive ships a `--extra_loss_start_epoch` flag that its trainer
+    # never reads, so its band loss is on from step 0. A ramp is available here
+    # because the band is meaningless until the silhouette roughly exists.
+    return weight * min(1.0, max(0, global_step) / float(warmup))
+
+
+def _flow_loss(
+    model,
+    diffusion,
+    target,
+    model_kwargs,
+    config,
+    timesteps=None,
+    noise=None,
+    band_scale=0.0,
+):
+    """Flow-matching loss under either the stochastic or deterministic regime.
+
+    Returns the loss and a dict of components for logging.
+    """
     if config.scheduler.deterministic_flow:
         x_t, timesteps = _deterministic_inputs(target, config.scheduler.train_sampling_steps)
         output = model(x_t, timesteps, **model_kwargs)
@@ -96,7 +123,30 @@ def _flow_loss(model, diffusion, target, model_kwargs, config, timesteps=None, n
             output = output["x"]
         # The flow target is `noise - x_start`, and noise is exactly zero here,
         # so the model regresses `-target` in a single step.
-        return ((output.float() + target.float()) ** 2).mean()
+        base = ((output.float() + target.float()) ** 2).mean()
+        parts = {"base": base.detach()}
+        if band_scale > 0.0:
+            # `-output` is the predicted matte, by the same identity.
+            band, terms = matting_band_loss(
+                -output,
+                target,
+                radius=sample_band_radius(
+                    config.train.matting_band_radius_min,
+                    config.train.matting_band_radius_max,
+                ),
+                sad_weight=config.train.matting_band_sad_weight,
+                mse_weight=config.train.matting_band_mse_weight,
+                grad_weight=config.train.matting_band_grad_weight,
+            )
+            parts.update({f"band_{name}": value.detach() for name, value in terms.items()})
+            parts["band_total"] = band.detach()
+            return base + band_scale * band, parts
+        return base, parts
+    if band_scale > 0.0:
+        raise ValueError(
+            "train.matting_band_loss_weight requires scheduler.deterministic_flow=true; "
+            "the stochastic regime predicts a velocity, not the matte itself"
+        )
     if timesteps is None:
         timesteps = torch.randint(
             0,
@@ -104,13 +154,14 @@ def _flow_loss(model, diffusion, target, model_kwargs, config, timesteps=None, n
             (target.shape[0],),
             device=target.device,
         ).long()
-    return diffusion.training_losses(
+    loss = diffusion.training_losses(
         model,
         target,
         timesteps,
         noise=noise,
         model_kwargs=model_kwargs,
     )["loss"].mean()
+    return loss, {"base": loss.detach()}
 
 
 @torch.no_grad()
@@ -150,6 +201,8 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, conf
             noise = torch.randn(target.shape, generator=generator, device=device, dtype=target.dtype)
         y = embeddings.to(device=device, dtype=target.dtype).unsqueeze(1)
         mask = attention_mask.to(device).unsqueeze(1).unsqueeze(1)
+        # Deliberately the base loss only: the correct-vs-shuffled probe stays
+        # comparable across runs with and without the band term.
         correct_losses.append(
             _flow_loss(
                 model,
@@ -159,7 +212,7 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, conf
                 config,
                 timesteps=timestep,
                 noise=noise,
-            )
+            )[0]
         )
         shuffled_losses.append(
             _flow_loss(
@@ -170,7 +223,7 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, conf
                 config,
                 timesteps=timestep,
                 noise=noise,
-            )
+            )[0]
         )
     correct = torch.stack(correct_losses).mean()
     shuffled = torch.stack(shuffled_losses).mean()
@@ -348,6 +401,17 @@ def main(config: PixDiTConfig) -> None:
         dropout=config.train.lora_dropout,
     )
     LOGGER.info("LoRA configuration: %s", lora_info)
+    if config.train.matting_band_loss_weight > 0.0:
+        LOGGER.info(
+            "Trimap-band loss: weight=%.3g (sad=%.3g mse=%.3g grad=%.3g), radius=%d-%d, warmup=%d",
+            config.train.matting_band_loss_weight,
+            config.train.matting_band_sad_weight,
+            config.train.matting_band_mse_weight,
+            config.train.matting_band_grad_weight,
+            config.train.matting_band_radius_min,
+            config.train.matting_band_radius_max,
+            config.train.matting_band_warmup_steps,
+        )
     LOGGER.info(
         "Flow regime: %s",
         "deterministic (zero input, single-step decode)"
@@ -476,12 +540,13 @@ def main(config: PixDiTConfig) -> None:
                 batch_size, -1, -1, -1
             )
             with accelerator.accumulate(model):
-                loss = _flow_loss(
+                loss, loss_parts = _flow_loss(
                     model,
                     diffusion,
                     target,
                     {"y": y, "mask": mask, "condition_image": condition},
                     config,
+                    band_scale=_band_loss_scale(config, global_step),
                 )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -508,14 +573,16 @@ def main(config: PixDiTConfig) -> None:
                         gathered_loss,
                     )
                     if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train/loss": gathered_loss,
-                                "train/learning_rate": lr_scheduler.get_last_lr()[0],
-                                "train/epoch": epoch,
-                            },
-                            step=global_step,
+                        payload = {
+                            "train/loss": gathered_loss,
+                            "train/learning_rate": lr_scheduler.get_last_lr()[0],
+                            "train/epoch": epoch,
+                        }
+                        payload.update(
+                            {f"train/{name}": value.item() for name, value in loss_parts.items()}
                         )
+                        payload["train/band_loss_scale"] = _band_loss_scale(config, global_step)
+                        wandb_run.log(payload, step=global_step)
             loss_accumulator.zero_()
             loss_microsteps = 0
 
@@ -591,6 +658,7 @@ def main(config: PixDiTConfig) -> None:
                         "use_sequence_type_embedding": config.model.use_sequence_type_embedding,
                         "conditioning_proj_init": config.model.conditioning_proj_init,
                         "deterministic_flow": config.scheduler.deterministic_flow,
+                        "matting_band_loss_weight": config.train.matting_band_loss_weight,
                         "prompt": prompt,
                         "subset_sample_ids": [record["sample_id"] for record in subset_records],
                         "run_name": config.name,

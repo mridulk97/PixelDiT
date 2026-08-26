@@ -22,6 +22,12 @@ def parse_args():
     parser.add_argument("--overfit_samples", type=int, default=0)
     parser.add_argument("--overfit_seed", type=int, default=2025)
     parser.add_argument("--output", default=None, help="Optional metrics JSON path")
+    parser.add_argument(
+        "--band_radius",
+        type=int,
+        default=10,
+        help="Dilate/erode radius defining the trimap unknown band for the band_* metrics",
+    )
     return parser.parse_args()
 
 
@@ -32,8 +38,8 @@ def _load_prediction(path: Path):
     return prediction.squeeze()
 
 
-def _evaluate(prediction_dir: Path, records):
-    totals = {name: 0.0 for name in ("sad", "mse", "mad", "gradient", "connectivity")}
+def _evaluate(prediction_dir: Path, records, band_radius: int = 10):
+    totals = {}
     per_sample = []
     for record in records:
         prediction_path = prediction_dir / f"{record['sample_id']}.npy"
@@ -43,10 +49,10 @@ def _evaluate(prediction_dir: Path, records):
         alpha = Image.open(record["alpha_path"]).convert("L")
         alpha = alpha.resize((prediction.shape[1], prediction.shape[0]), Image.Resampling.BILINEAR)
         target = np.asarray(alpha, dtype=np.float32) / 255.0
-        values = compute_matting_metrics(prediction, target)
+        values = compute_matting_metrics(prediction, target, band_radius=band_radius)
         per_sample.append({"sample_id": record["sample_id"], **values})
         for name, value in values.items():
-            totals[name] += value
+            totals[name] = totals.get(name, 0.0) + value
     mean = {name: value / len(records) for name, value in totals.items()}
     return {"count": len(records), "mean": mean, "per_sample": per_sample}
 
@@ -62,9 +68,11 @@ def main():
             "overfit_seed": args.overfit_seed,
         },
     )
-    result = {"correct": _evaluate(Path(args.pred_dir), dataset.dataset)}
+    result = {"correct": _evaluate(Path(args.pred_dir), dataset.dataset, args.band_radius)}
     if args.shuffled_pred_dir:
-        result["shuffled"] = _evaluate(Path(args.shuffled_pred_dir), dataset.dataset)
+        result["shuffled"] = _evaluate(
+            Path(args.shuffled_pred_dir), dataset.dataset, args.band_radius
+        )
         result["correct_minus_shuffled_mse"] = (
             result["correct"]["mean"]["mse"] - result["shuffled"]["mean"]["mse"]
         )

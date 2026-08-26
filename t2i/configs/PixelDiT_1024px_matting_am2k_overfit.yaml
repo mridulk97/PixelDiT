@@ -70,6 +70,16 @@ train:
   gradient_accumulation_steps: 1
   grad_checkpointing: true
   gradient_clip: 1.0
+  # Trimap-band matting losses on top of the whole-image term. At step 1,550 of
+  # the deterministic `both` run the band held 96.4% of the squared error while
+  # covering 8.8% of pixels, so uniform MSE had almost nothing left to say.
+  matting_band_loss_weight: 1.0
+  matting_band_sad_weight: 1.0
+  matting_band_mse_weight: 1.0
+  matting_band_grad_weight: 1.0
+  matting_band_radius_min: 10
+  matting_band_radius_max: 40
+  matting_band_warmup_steps: 200
   lora_rank: 16
   lora_alpha: 16.0
   lora_dropout: 0.0

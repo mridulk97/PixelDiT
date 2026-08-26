@@ -125,14 +125,46 @@ def connectivity_error(prediction, target, step=0.1):
     return float(np.abs(prediction_phi - target_phi).sum(dtype=np.float64) / 1000.0)
 
 
-def compute_matting_metrics(prediction, target) -> Dict[str, float]:
+def unknown_band(target, radius: int = 10):
+    """Trimap unknown region of a `[0, 1]` alpha, via a dilate/erode pair.
+
+    Whole-image metrics are dominated by the flat interior and background,
+    which a converged model already has right; the band is what is still
+    wrong. Implemented with maximum filters so the evaluator keeps working
+    without OpenCV or SciPy.
+    """
+    if radius <= 0:
+        return np.ones_like(target, dtype=bool)
+    size = 2 * radius + 1
+    padded = np.pad(target, radius, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (size, size))
+    dilated = windows.max(axis=(-2, -1))
+    eroded = windows.min(axis=(-2, -1))
+    return (dilated > 1.0 / 255.0) & (eroded < 254.0 / 255.0)
+
+
+def compute_matting_metrics(prediction, target, band_radius: int = 10) -> Dict[str, float]:
     prediction, target = _validate(prediction, target)
     difference = prediction - target
     absolute = np.abs(difference)
-    return {
+    band = unknown_band(target, band_radius)
+    band_count = int(band.sum())
+    squared = np.square(difference)
+    metrics = {
         "sad": float(absolute.sum(dtype=np.float64) / 1000.0),
-        "mse": float(np.mean(np.square(difference), dtype=np.float64)),
+        "mse": float(np.mean(squared, dtype=np.float64)),
         "mad": float(np.mean(absolute, dtype=np.float64)),
         "gradient": gradient_error(prediction, target),
         "connectivity": connectivity_error(prediction, target),
+        "band_fraction": float(band.mean()),
     }
+    if band_count:
+        metrics["band_sad"] = float(absolute[band].sum(dtype=np.float64) / 1000.0)
+        metrics["band_mse"] = float(np.mean(squared[band], dtype=np.float64))
+        metrics["band_mad"] = float(np.mean(absolute[band], dtype=np.float64))
+        metrics["band_error_share"] = float(
+            squared[band].sum(dtype=np.float64) / max(squared.sum(dtype=np.float64), 1e-12)
+        )
+    else:
+        metrics.update({"band_sad": 0.0, "band_mse": 0.0, "band_mad": 0.0, "band_error_share": 0.0})
+    return metrics
