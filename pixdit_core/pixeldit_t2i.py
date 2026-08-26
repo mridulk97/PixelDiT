@@ -188,7 +188,14 @@ class PixDiT_T2I(nn.Module):
             None if sequence_rope_offset is None else float(sequence_rope_offset)
         )
         self.use_sequence_type_embedding = bool(use_sequence_type_embedding)
-        valid_conditioning_modes = {"none", "patch", "pixel", "both", "sequence"}
+        valid_conditioning_modes = {
+            "none",
+            "patch",
+            "pixel",
+            "both",
+            "sequence",
+            "sequence_pixel",
+        }
         if self.conditioning_mode not in valid_conditioning_modes:
             raise ValueError(
                 f"conditioning_mode must be one of {sorted(valid_conditioning_modes)}, "
@@ -199,11 +206,20 @@ class PixDiT_T2I(nn.Module):
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
+        # The reference image can enter through three independent doors, and a
+        # mode is just a choice of which doors are open.
+        # patch:    widen the patch projection with reference patch vectors.
+        # sequence: append reference patch tokens as a second block.
+        # pixel:    concatenate reference channels into the pixel branch.
+        self.patch_conditioning = self.conditioning_mode in {"patch", "both"}
+        self.sequence_conditioning = self.conditioning_mode in {"sequence", "sequence_pixel"}
+        self.pixel_conditioning = self.conditioning_mode in {"pixel", "both", "sequence_pixel"}
+
         patch_input_channels = in_channels * patch_size ** 2
         pixel_input_channels = in_channels
-        if self.conditioning_mode in {"patch", "both"}:
+        if self.patch_conditioning:
             patch_input_channels *= 2
-        if self.conditioning_mode in {"pixel", "both"}:
+        if self.pixel_conditioning:
             pixel_input_channels *= 2
 
         self.pixel_embedder = PixelTokenEmbedder(
@@ -212,9 +228,16 @@ class PixDiT_T2I(nn.Module):
             use_pixel_abs_pos=self.use_pixel_abs_pos,
         )
         self.s_embedder = PatchTokenEmbedder(patch_input_channels, hidden_size, bias=True)
-        if self.conditioning_mode == "sequence" and self.use_sequence_type_embedding:
+        if self.sequence_conditioning and self.use_sequence_type_embedding:
+            # Under aligned RoPE the target and reference blocks occupy the same
+            # positions and share one projection, so these embeddings carry the
+            # only signal that tells the two streams apart. initialize_weights
+            # gives them a non-zero start; leaving them at zero makes the split
+            # degenerate at step 0 and the model has to route on content alone.
+            self.target_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
             self.reference_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
         else:
+            self.register_parameter("target_type_embedding", None)
             self.register_parameter("reference_type_embedding", None)
         self.t_embedder = TimestepConditioner(hidden_size)
         self.y_embedder = PatchTokenEmbedder(self.txt_embed_dim, hidden_size, bias=True, norm_layer=RMSNorm)
@@ -310,6 +333,9 @@ class PixDiT_T2I(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.zeros_(self.final_layer.linear.weight)
         nn.init.zeros_(self.final_layer.linear.bias)
+        for type_embedding in (self.target_type_embedding, self.reference_type_embedding):
+            if type_embedding is not None:
+                nn.init.normal_(type_embedding, std=0.02)
 
     def forward(self, x, t, y, condition_image=None, s=None, mask=None):
         B, _, H, W = x.shape
@@ -337,12 +363,12 @@ class PixDiT_T2I(nn.Module):
 
         pos = (
             self._sequence_positions(Hs, Ws, x.device)
-            if self.conditioning_mode == "sequence"
+            if self.sequence_conditioning
             else self.fetch_pos(Hs, Ws, x.device)
         )
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         condition_patches = None
-        if condition_image is not None and self.conditioning_mode in {"patch", "both", "sequence"}:
+        if condition_image is not None and (self.patch_conditioning or self.sequence_conditioning):
             condition_patches = torch.nn.functional.unfold(
                 condition_image,
                 kernel_size=self.patch_size,
@@ -361,11 +387,15 @@ class PixDiT_T2I(nn.Module):
         time_condition = torch.nn.functional.silu(t_emb)
 
         if s is None:
-            if self.conditioning_mode in {"patch", "both"}:
+            if self.patch_conditioning:
                 s0 = self.s_embedder(torch.cat([x_patches, condition_patches], dim=-1))
-            elif self.conditioning_mode == "sequence":
+            elif self.sequence_conditioning:
                 target_tokens = self.s_embedder(x_patches)
                 reference_tokens = self.s_embedder(condition_patches)
+                if self.target_type_embedding is not None:
+                    target_tokens = target_tokens + self.target_type_embedding.to(
+                        dtype=target_tokens.dtype
+                    )
                 if self.reference_type_embedding is not None:
                     reference_tokens = reference_tokens + self.reference_type_embedding.to(
                         dtype=reference_tokens.dtype
@@ -383,7 +413,7 @@ class PixDiT_T2I(nn.Module):
                     m = m.squeeze(1)
                 if m.dim() == 2:
                     pad = (m == 0)
-                    image_length = 2 * L if self.conditioning_mode == "sequence" else L
+                    image_length = 2 * L if self.sequence_conditioning else L
                     pad_img = torch.zeros((B, image_length), dtype=torch.bool, device=x.device)
                     attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
                         B, 1, 1, Ltxt + image_length
@@ -415,7 +445,7 @@ class PixDiT_T2I(nn.Module):
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s[:, :L, :]
             s = torch.nn.functional.silu(t_emb + s)
-            if self.conditioning_mode == "sequence":
+            if self.sequence_conditioning:
                 s = s[:, :L, :]
         if not (0 < self.repa_encoder_index <= self.patch_depth):
             self.last_repa_tokens = s[:, :L, :]
@@ -434,7 +464,7 @@ class PixDiT_T2I(nn.Module):
         s_cond = s.reshape(B * L, self.hidden_size)
         pixel_inputs = (
             torch.cat([x, condition_image], dim=1)
-            if self.conditioning_mode in {"pixel", "both"}
+            if self.pixel_conditioning
             else x
         )
         x_pixels = self.pixel_embedder(

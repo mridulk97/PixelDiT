@@ -69,11 +69,66 @@ def _encode_fixed_prompt(config, device):
     return prompt, embeddings, attention_mask
 
 
+def _deterministic_inputs(target, train_sampling_steps):
+    """Model input and timestep for the deterministic regime.
+
+    The input is pinned to exactly zero at the top of the schedule. A noisy
+    copy of the target is what lets the model reach low flow loss without ever
+    reading the condition -- it can denoise or recall the matte from `x_t`
+    alone. Removing that input entirely is the point: the reference image
+    becomes the only thing carrying information about the answer.
+    """
+    timesteps = torch.full(
+        (target.shape[0],),
+        int(train_sampling_steps) - 1,
+        device=target.device,
+        dtype=torch.long,
+    )
+    return torch.zeros_like(target), timesteps
+
+
+def _flow_loss(model, diffusion, target, model_kwargs, config, timesteps=None, noise=None):
+    """Flow-matching loss under either the stochastic or deterministic regime."""
+    if config.scheduler.deterministic_flow:
+        x_t, timesteps = _deterministic_inputs(target, config.scheduler.train_sampling_steps)
+        output = model(x_t, timesteps, **model_kwargs)
+        if isinstance(output, dict):
+            output = output["x"]
+        # The flow target is `noise - x_start`, and noise is exactly zero here,
+        # so the model regresses `-target` in a single step.
+        return ((output.float() + target.float()) ** 2).mean()
+    if timesteps is None:
+        timesteps = torch.randint(
+            0,
+            config.scheduler.train_sampling_steps,
+            (target.shape[0],),
+            device=target.device,
+        ).long()
+    return diffusion.training_losses(
+        model,
+        target,
+        timesteps,
+        noise=noise,
+        model_kwargs=model_kwargs,
+    )["loss"].mean()
+
+
 @torch.no_grad()
-def _validation_losses(model, diffusion, batch, embeddings, attention_mask, num_steps):
+def _decode_deterministic(model, target_like, model_kwargs, train_sampling_steps):
+    """Single forward pass from a zero input; `x_start = -v` when noise is zero."""
+    x_t, timesteps = _deterministic_inputs(target_like, train_sampling_steps)
+    output = model(x_t, timesteps, **model_kwargs)
+    if isinstance(output, dict):
+        output = output["x"]
+    return -output
+
+
+@torch.no_grad()
+def _validation_losses(model, diffusion, batch, embeddings, attention_mask, config):
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
+    num_steps = int(config.scheduler.train_sampling_steps)
     cpu_targets = batch[0]
     cpu_conditions = batch[8]
     if cpu_targets.shape[0] < 2:
@@ -88,27 +143,34 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, num_
         condition = cpu_conditions[index : index + 1].to(device)
         shuffled_index = (index + 1) % cpu_targets.shape[0]
         shuffled_condition = cpu_conditions[shuffled_index : shuffled_index + 1].to(device)
-        timestep = torch.full((1,), num_steps // 2, device=device, dtype=torch.long)
-        noise = torch.randn(target.shape, generator=generator, device=device, dtype=target.dtype)
+        timestep = None
+        noise = None
+        if not config.scheduler.deterministic_flow:
+            timestep = torch.full((1,), num_steps // 2, device=device, dtype=torch.long)
+            noise = torch.randn(target.shape, generator=generator, device=device, dtype=target.dtype)
         y = embeddings.to(device=device, dtype=target.dtype).unsqueeze(1)
         mask = attention_mask.to(device).unsqueeze(1).unsqueeze(1)
         correct_losses.append(
-            diffusion.training_losses(
+            _flow_loss(
                 model,
+                diffusion,
                 target,
-                timestep,
+                {"y": y, "mask": mask, "condition_image": condition},
+                config,
+                timesteps=timestep,
                 noise=noise,
-                model_kwargs={"y": y, "mask": mask, "condition_image": condition},
-            )["loss"].mean()
+            )
         )
         shuffled_losses.append(
-            diffusion.training_losses(
+            _flow_loss(
                 model,
+                diffusion,
                 target,
-                timestep,
+                {"y": y, "mask": mask, "condition_image": shuffled_condition},
+                config,
+                timesteps=timestep,
                 noise=noise,
-                model_kwargs={"y": y, "mask": mask, "condition_image": shuffled_condition},
-            )["loss"].mean()
+            )
         )
     correct = torch.stack(correct_losses).mean()
     shuffled = torch.stack(shuffled_losses).mean()
@@ -125,6 +187,7 @@ def _sample_training_grid(
     sample_steps,
     flow_shift,
     num_examples,
+    config,
 ):
     """Generate fixed-seed alpha samples and arrange input/generated/GT triplets."""
     was_training = model.training
@@ -137,32 +200,42 @@ def _sample_training_grid(
         batch_size, -1, -1, -1
     )
     mask = attention_mask.to(device).expand(batch_size, -1)
-    generator = torch.Generator(device=device).manual_seed(2025)
-    noise = torch.randn(
-        target.shape,
-        generator=generator,
-        device=device,
-        dtype=target.dtype,
-    )
-    solver = DPMS(
-        model.forward_with_dpmsolver,
-        condition=y,
-        uncondition=None,
-        guidance_type="classifier-free",
-        cfg_scale=1.0,
-        model_type="flow",
-        model_kwargs={"mask": mask, "condition_image": condition},
-        schedule="FLOW",
-        interval_guidance=[0, 1],
-    )
-    samples = solver.sample(
-        noise,
-        steps=int(sample_steps),
-        order=2,
-        skip_type="time_uniform_flow",
-        method="multistep",
-        flow_shift=float(flow_shift),
-    )
+    if config.scheduler.deterministic_flow:
+        # One forward pass, no sampler and no seed: the regime is deterministic
+        # end to end, so `sample_steps` and `flow_shift` do not apply.
+        samples = _decode_deterministic(
+            model,
+            target,
+            {"y": y, "mask": mask, "condition_image": condition},
+            config.scheduler.train_sampling_steps,
+        )
+    else:
+        generator = torch.Generator(device=device).manual_seed(2025)
+        noise = torch.randn(
+            target.shape,
+            generator=generator,
+            device=device,
+            dtype=target.dtype,
+        )
+        solver = DPMS(
+            model.forward_with_dpmsolver,
+            condition=y,
+            uncondition=None,
+            guidance_type="classifier-free",
+            cfg_scale=1.0,
+            model_type="flow",
+            model_kwargs={"mask": mask, "condition_image": condition},
+            schedule="FLOW",
+            interval_guidance=[0, 1],
+        )
+        samples = solver.sample(
+            noise,
+            steps=int(sample_steps),
+            order=2,
+            skip_type="time_uniform_flow",
+            method="multistep",
+            flow_shift=float(flow_shift),
+        )
     generated_alpha = ((samples.float() + 1.0) * 0.5).mean(dim=1).clamp(0.0, 1.0)
     target_alpha = ((target.float() + 1.0) * 0.5).mean(dim=1).clamp(0.0, 1.0)
     input_rgb = ((condition.float() + 1.0) * 0.5).clamp(0.0, 1.0)
@@ -211,8 +284,11 @@ def _init_wandb(config, lora_info, prompt, resolved_config_path, run_metadata):
 
 @pyrallis.wrap()
 def main(config: PixDiTConfig) -> None:
-    if config.model.conditioning_mode not in {"patch", "pixel", "both", "sequence"}:
-        raise ValueError("Matting training requires conditioning_mode=patch|pixel|both|sequence")
+    if config.model.conditioning_mode not in {"patch", "pixel", "both", "sequence", "sequence_pixel"}:
+        raise ValueError(
+            "Matting training requires "
+            "conditioning_mode=patch|pixel|both|sequence|sequence_pixel"
+        )
     if config.model.multi_scale:
         raise ValueError("The AM-2K overfit pilot uses fixed-resolution training")
     if config.train.ema_update:
@@ -257,7 +333,7 @@ def main(config: PixDiTConfig) -> None:
     )
     base_checkpoint = resolve_checkpoint(config.model.load_from or "pixeldit_t2i_v1.pth")
     load_result = model.load_state_dict(_checkpoint_state_dict(base_checkpoint), strict=False)
-    allowed_missing = {"core.reference_type_embedding"}
+    allowed_missing = {"core.reference_type_embedding", "core.target_type_embedding"}
     disallowed_missing = [key for key in load_result.missing_keys if key not in allowed_missing]
     if disallowed_missing or load_result.unexpected_keys:
         raise RuntimeError(
@@ -272,6 +348,12 @@ def main(config: PixDiTConfig) -> None:
         dropout=config.train.lora_dropout,
     )
     LOGGER.info("LoRA configuration: %s", lora_info)
+    LOGGER.info(
+        "Flow regime: %s",
+        "deterministic (zero input, single-step decode)"
+        if config.scheduler.deterministic_flow
+        else "stochastic (random timestep, multi-step sampler)",
+    )
 
     dataset = build_dataset(
         asdict(config.data),
@@ -393,19 +475,14 @@ def main(config: PixDiTConfig) -> None:
             mask = prompt_mask.to(target.device).unsqueeze(1).unsqueeze(1).expand(
                 batch_size, -1, -1, -1
             )
-            timesteps = torch.randint(
-                0,
-                config.scheduler.train_sampling_steps,
-                (batch_size,),
-                device=target.device,
-            ).long()
             with accelerator.accumulate(model):
-                loss = diffusion.training_losses(
+                loss = _flow_loss(
                     model,
+                    diffusion,
                     target,
-                    timesteps,
-                    model_kwargs={"y": y, "mask": mask, "condition_image": condition},
-                )["loss"].mean()
+                    {"y": y, "mask": mask, "condition_image": condition},
+                    config,
+                )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable, config.train.gradient_clip)
@@ -453,7 +530,7 @@ def main(config: PixDiTConfig) -> None:
                         validation_batch,
                         prompt_embeddings,
                         prompt_mask,
-                        config.scheduler.train_sampling_steps,
+                        config,
                     )
                     LOGGER.info(
                         "validation step=%d correct_loss=%.6f shuffled_loss=%.6f",
@@ -482,6 +559,7 @@ def main(config: PixDiTConfig) -> None:
                                 config.train.wandb_sampling_steps,
                                 config.scheduler.flow_shift,
                                 max(1, int(config.train.wandb_num_examples)),
+                                config,
                             )
                             preview_dir = Path(config.work_dir) / "previews"
                             preview_dir.mkdir(parents=True, exist_ok=True)
@@ -511,6 +589,8 @@ def main(config: PixDiTConfig) -> None:
                         "sequence_rope_mode": config.model.sequence_rope_mode,
                         "sequence_rope_offset": config.model.sequence_rope_offset,
                         "use_sequence_type_embedding": config.model.use_sequence_type_embedding,
+                        "conditioning_proj_init": config.model.conditioning_proj_init,
+                        "deterministic_flow": config.scheduler.deterministic_flow,
                         "prompt": prompt,
                         "subset_sample_ids": [record["sample_id"] for record in subset_records],
                         "run_name": config.name,

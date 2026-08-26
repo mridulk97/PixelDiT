@@ -4,12 +4,76 @@ This pilot fine-tunes PixelDiT to generate a three-channel copy of an alpha matt
 
 ## Conditioning ablations
 
+The reference image can enter through three independent doors, and a mode is a
+choice of which are open:
+
 - `patch`: concatenate noisy-alpha and RGB patch vectors, then use the widened patch projection.
 - `pixel`: concatenate noisy-alpha and RGB channels before the pixel projection.
 - `both`: use both channel-concatenation paths.
 - `sequence`: project noisy-alpha and RGB patches separately with the same frozen pretrained projection, concatenate `4096 + 4096` tokens, and retain the first `4096` tokens for pixel decoding.
+- `sequence_pixel`: sequence conditioning on the patch stream **and** channel concatenation on the pixel stream. Plain `sequence` leaves the pixel decoder with no access to the reference at all, which matters for a task decided by sub-patch detail.
 
-Only widened channel-concat projections use `[W_old/sqrt(2), W_old/sqrt(2)]`. Sequence conditioning does not widen or duplicate the pretrained projection. It uses aligned 2D RoPE by default and a zero-initialized reference-type embedding; set `--model.sequence_rope_mode=offset` to test the one-grid-offset alternative.
+### Widened-projection initialization
+
+`--model.conditioning_proj_init` controls how `patch`/`pixel`/`both`/`sequence_pixel`
+grow their pretrained input projections:
+
+- `zero` (default): `[W_old, 0]`. The widened layer computes exactly `W_old @ x`
+  at step 0, so the model starts bit-identical to the pretrained checkpoint and
+  the conditioning pathway grows from zero, like the zero-initialized LoRA `B`
+  matrices.
+- `balanced`: the legacy `[W_old/sqrt(2), W_old/sqrt(2)]`. This preserves
+  activation *scale* but not the *function* — the layer computes
+  `W_old @ (x + c)/sqrt(2)` while every downstream block was pretrained on
+  `W_old @ x`. Training's first few hundred steps go to undoing that, which is
+  why `both` started near loss 1.05 while `sequence` (which widens nothing)
+  started near 0.15. Keep it only to reproduce the older runs.
+
+### Sequence-mode stream separation
+
+Sequence conditioning does not widen or duplicate the pretrained patch
+projection, and it stays frozen: both streams are natural-image-like inputs the
+pretrained projection already handles, so there is nothing new to fit.
+
+With `sequence_rope_mode=aligned` (the default) the target and reference blocks
+receive *identical* RoPE positions and pass through that one shared projection,
+so the learned target/reference type embeddings carry the only signal that
+separates them. Both are therefore initialized at `std=0.02` rather than zero —
+at zero the split is degenerate at step 0 and the model can only route on
+content, which works at high noise levels and fails at the low-noise steps that
+decide sample quality. Set `--model.sequence_rope_mode=offset` to test the
+Kontext-style one-grid-offset alternative instead.
+
+## Flow regime
+
+`--scheduler.deterministic_flow` (default `true`) decides what the model sees
+as input.
+
+- `true`: the model input is pinned to exactly zero at the top of the schedule
+  and the flow target reduces to `-x_start`, so training is a single-step
+  regression and inference is one forward pass with `x_start = -v`. No sampler,
+  no seed; `train.wandb_sampling_steps` and `scheduler.flow_shift` do not apply.
+- `false`: the original stochastic regime -- random timestep, real noise, and a
+  20-step DPM-solver at preview time.
+
+The stochastic regime turned out to be the reason the earlier runs looked like
+they were training while producing nothing usable. An alpha matte is a
+near-binary, smooth, extremely low-complexity target, so `x_t` at the sampled
+timesteps still identifies which matte it came from. "Recognize the noisy matte,
+recall the matte" drives the flow loss to ~0.002 without ever reading the
+conditioning image, and sampling then starts from pure noise where that
+recognition signal does not exist. Measured on the 4,000-step `both` run:
+between step 1,500 and 3,900 the training loss improved 2.3x while the generated
+MSE got 2.2x worse and the correct-vs-shuffled conditioning gap decayed from 44%
+to 13%. Every checkpoint except that run's step 1,500 was at or worse than
+predicting a constant image (all-black MSE 0.266, constant-mean MSE 0.193).
+
+Pinning the input to zero removes the shortcut by construction rather than
+discouraging it: with no signal in the input, the conditioning image is the only
+thing that carries information about the answer. Note that the input must be
+*exactly* zero, not merely small -- at the top timestep `q_sample` still leaks
+`alpha = 2.5e-4` of the target, and a scaled copy of the target is still the
+target once a normalization layer has rescaled it.
 
 ## Training
 
@@ -22,6 +86,7 @@ bash run_matting_overfit_2gpu.sh patch
 bash run_matting_overfit_2gpu.sh pixel
 bash run_matting_overfit_2gpu.sh both
 bash run_matting_overfit_2gpu.sh sequence
+bash run_matting_overfit_2gpu.sh sequence_pixel
 ```
 
 For one job spanning two GPUs visible in the same shell, set
@@ -106,7 +171,7 @@ python evaluate_matting.py \
   --split train --overfit_samples 16
 ```
 
-The evaluator reports whole-image SAD, MSE, MAD, gradient, and connectivity errors. The pilot succeeds when training loss decreases, correct-condition MSE is below shuffled-condition MSE, output alpha changes when RGB conditions are shuffled, and reloaded adapters reproduce identical outputs for a fixed seed.
+The evaluator reports whole-image SAD, MSE, MAD, gradient, and connectivity errors. The pilot succeeds when correct-condition MSE is below shuffled-condition MSE, output alpha changes when RGB conditions are shuffled, and reloaded adapters reproduce identical outputs. Judge runs on `validation/generated_mse` and the correct-vs-shuffled gap, never on training loss alone: those two diverged for thousands of steps in the stochastic runs. Treat a conditioning gap under ~10% as a failed run rather than an early one, and compare `generated_mse` against the trivial baselines (all-black 0.266, constant-mean 0.193) before calling a result good.
 
 ## Smoke tests
 

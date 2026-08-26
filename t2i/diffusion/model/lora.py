@@ -121,14 +121,19 @@ def configure_matting_trainable_parameters(
     core = model.core
     mode = core.conditioning_mode
 
-    if mode in {"patch", "both"}:
+    # Only a widened projection needs training: it has newly initialized input
+    # columns that no pretrained weight covers. Sequence modes reuse the
+    # pretrained patch projection unchanged for both streams, so it stays
+    # frozen and the stream distinction is carried by the type embeddings.
+    if core.patch_conditioning:
         for parameter in core.s_embedder.proj.parameters():
             parameter.requires_grad = True
-    if mode in {"pixel", "both"}:
+    if core.pixel_conditioning:
         for parameter in core.pixel_embedder.proj.parameters():
             parameter.requires_grad = True
-    if mode == "sequence" and core.reference_type_embedding is not None:
-        core.reference_type_embedding.requires_grad = True
+    for type_embedding in (core.target_type_embedding, core.reference_type_embedding):
+        if type_embedding is not None:
+            type_embedding.requires_grad = True
     for parameter in core.final_layer.parameters():
         parameter.requires_grad = True
 

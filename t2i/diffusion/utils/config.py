@@ -82,6 +82,7 @@ class ModelConfig(BaseConfig):
     cfg_embed_scale: float = 1.0
     guidance_type: str = "classifier-free"
     conditioning_mode: str = "none"
+    conditioning_proj_init: str = "zero"
     sequence_rope_mode: str = "aligned"
     sequence_rope_offset: Optional[float] = None
     use_sequence_type_embedding: bool = True
@@ -123,6 +124,7 @@ class SchedulerConfig(BaseConfig):
     learn_sigma: bool = True
     vis_sampler: str = "flow_dpm-solver"
     flow_shift: float = 1.0
+    deterministic_flow: bool = False
     # logit-normal timestep
     weighting_scheme: Optional[str] = "logit_normal"
     weighting_scheme_discriminator: Optional[str] = "logit_normal_trigflow"

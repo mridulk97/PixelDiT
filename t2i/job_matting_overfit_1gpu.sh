@@ -17,7 +17,7 @@ if (( $# > 0 )); then
   shift
 fi
 case "$mode" in
-  patch|pixel|both|sequence) ;;
+  patch|pixel|both|sequence|sequence_pixel) ;;
   *)
     echo "Unsupported conditioning mode: $mode" >&2
     exit 2

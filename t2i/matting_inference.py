@@ -129,12 +129,14 @@ def _condition_tensor(path: Path, image_size: int, device, dtype):
 
 def _apply_adapter_metadata(config, metadata):
     required_mode = metadata.get("conditioning_mode")
-    if required_mode not in {"patch", "pixel", "both", "sequence"}:
+    if required_mode not in {"patch", "pixel", "both", "sequence", "sequence_pixel"}:
         raise RuntimeError(f"Adapter has invalid conditioning_mode={required_mode!r}")
     config.model.conditioning_mode = required_mode
     config.model.sequence_rope_mode = metadata.get("sequence_rope_mode", "aligned")
     config.model.sequence_rope_offset = metadata.get("sequence_rope_offset")
     config.model.use_sequence_type_embedding = metadata.get("use_sequence_type_embedding", True)
+    config.model.conditioning_proj_init = metadata.get("conditioning_proj_init", "zero")
+    config.scheduler.deterministic_flow = bool(metadata.get("deterministic_flow", False))
     if int(metadata.get("image_size", config.model.image_size)) != int(config.model.image_size):
         raise RuntimeError("Adapter and inference config image sizes do not match")
 
@@ -164,7 +166,7 @@ def main():
         **model_init_config(config, latent_size=config.model.image_size),
     )
     result = model.load_state_dict(_base_state_dict(base_path), strict=False)
-    allowed_missing = {"core.reference_type_embedding"}
+    allowed_missing = {"core.reference_type_embedding", "core.target_type_embedding"}
     missing = [name for name in result.missing_keys if name not in allowed_missing]
     if missing or result.unexpected_keys:
         raise RuntimeError(f"Base checkpoint mismatch: missing={missing}, unexpected={result.unexpected_keys}")
@@ -193,6 +195,50 @@ def main():
 
     for index, (target_path, condition_path) in enumerate(zip(target_paths, condition_paths)):
         condition = _condition_tensor(condition_path, config.model.image_size, device, weight_dtype)
+        if config.scheduler.deterministic_flow:
+            # Mirror training exactly: zero input at the top of the schedule,
+            # one forward pass, and `x_start = -v` because noise is zero.
+            zeros = torch.zeros(
+                1,
+                3,
+                config.model.image_size,
+                config.model.image_size,
+                device=device,
+                dtype=weight_dtype,
+            )
+            timesteps = torch.full(
+                (1,),
+                int(config.scheduler.train_sampling_steps) - 1,
+                device=device,
+                dtype=torch.long,
+            )
+            velocity = model(
+                zeros,
+                timesteps,
+                caption_embeddings,
+                mask=caption_mask,
+                condition_image=condition,
+            )
+            if isinstance(velocity, dict):
+                velocity = velocity["x"]
+            sample = -velocity
+            alpha = ((sample.float() + 1.0) * 0.5).mean(dim=1)[0].clamp(0.0, 1.0).cpu().numpy()
+            npy_path = output_dir / f"{target_path.stem}.npy"
+            png_path = output_dir / f"{target_path.stem}.png"
+            np.save(npy_path, alpha.astype(np.float32, copy=False))
+            Image.fromarray(np.round(alpha * 255.0).astype(np.uint8), mode="L").save(png_path)
+            records.append(
+                {
+                    "sample": target_path.stem,
+                    "input": str(target_path.resolve()),
+                    "condition": str(condition_path.resolve()),
+                    "seed": None,
+                    "npy": str(npy_path.resolve()),
+                    "png": str(png_path.resolve()),
+                }
+            )
+            print(f"[{index + 1}/{len(target_paths)}] {target_path.name} -> {png_path}", flush=True)
+            continue
         generator = torch.Generator(device=device).manual_seed(args.seed + index)
         noise = torch.randn(
             1,
@@ -245,6 +291,7 @@ def main():
         "base_checkpoint": str(base_path),
         "adapter": str(Path(args.adapter_path).resolve()),
         "shuffled_conditions": bool(args.shuffle_conditions),
+        "deterministic_flow": bool(config.scheduler.deterministic_flow),
         "records": records,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
