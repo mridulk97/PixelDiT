@@ -11,11 +11,23 @@ case "$mode" in
     ;;
 esac
 
-config="configs/PixelDiT_1024px_matting_am2k_overfit.yaml"
+# Which dataset this run trains on. AM-2K is animal photographs with hard-ish
+# edges; D-646 is composited foregrounds (glass, water, veils, fine hair) and is
+# where partial coverage actually lives.
+dataset="${MATTING_DATASET:-am2k}"
+case "$dataset" in
+  am2k) config="configs/PixelDiT_1024px_matting_am2k_overfit.yaml"; data_setup="setup_am2k_data.sh" ;;
+  d646) config="configs/PixelDiT_1024px_matting_d646_overfit.yaml"; data_setup="setup_d646_data.sh" ;;
+  *)
+    echo "Unsupported MATTING_DATASET: $dataset (expected am2k or d646)" >&2
+    exit 2
+    ;;
+esac
+config="${MATTING_CONFIG:-$config}"
 num_processes="${NPROC_PER_NODE:-1}"
 timestamp="${MATTING_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-run_name="${MATTING_RUN_NAME:-pixeldit-matting-am2k-${mode}_${timestamp}}"
-run_root="${MATTING_RUN_ROOT:-/scratch/mridul/runs/matting/v1}"
+run_name="${MATTING_RUN_NAME:-pixeldit-matting-${dataset}-${mode}_${timestamp}}"
+run_root="${MATTING_RUN_ROOT:-/scratch/mridul/runs/matting/v2}"
 work_dir="${MATTING_RUN_DIR:-${run_root}/${run_name}}"
 
 if [[ -z "${CONDA_PREFIX:-}" ]]; then
@@ -56,6 +68,14 @@ if (( visible_gpus < num_processes )); then
   exit 2
 fi
 
+# These datasets live on scratch and get reaped periodically: extraction stamps
+# every image with the archive's own build date, so an age-based cleanup treats
+# a fresh extract as years stale. Rebuild and re-stamp before every launch.
+# Costs about ten seconds when the data is already in place.
+if [[ "${MATTING_SKIP_DATA_SETUP:-0}" != "1" ]]; then
+  bash "$(dirname "${BASH_SOURCE[0]}")/${data_setup}"
+fi
+
 mkdir -p "$work_dir"
 export WANDB_DIR="$work_dir"
 export WANDB_CACHE_DIR="$work_dir/.wandb_cache"
@@ -63,6 +83,8 @@ export WANDB_DATA_DIR="$work_dir/.wandb_data"
 export WANDB_ARTIFACT_DIR="$work_dir/artifacts"
 
 echo "PixelDiT matting run: $run_name"
+echo "Dataset:              $dataset"
+echo "Config:               $config"
 echo "Conditioning mode:    $mode"
 echo "Run directory:        $work_dir"
 echo "Runtime:              $runtime_info"

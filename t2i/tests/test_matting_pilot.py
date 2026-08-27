@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from PIL import Image
 import torch.nn as nn
 
 
@@ -17,7 +18,11 @@ for directory in (str(REPO_ROOT), str(T2I_ROOT)):
     if directory not in sys.path:
         sys.path.insert(0, directory)
 
-from diffusion.data.datasets.pixdit_datasets import AM2KMattingDataset
+from diffusion.data.datasets.pixdit_datasets import (
+    AM2KMattingDataset,
+    Distinctions646MattingDataset,
+    _group_stratified_subset,
+)
 from diffusion import Scheduler
 from diffusion.model.lora import (
     configure_matting_trainable_parameters,
@@ -704,6 +709,304 @@ class DataAndMetricTests(unittest.TestCase):
         self.assertGreater(wrong["mad"], 0.0)
         self.assertGreater(wrong["gradient"], 0.0)
         self.assertGreater(wrong["connectivity"], 0.0)
+
+
+class RefinementHeadTests(unittest.TestCase):
+    """The head is the only module that couples pixels across a patch seam."""
+
+    @staticmethod
+    def _core(mode="both", **head_kwargs):
+        return PixDiT_T2I(
+            in_channels=3,
+            num_groups=4,
+            hidden_size=32,
+            pixel_hidden_size=4,
+            pixel_attn_hidden_size=32,
+            pixel_num_groups=4,
+            patch_depth=1,
+            pixel_depth=1,
+            num_text_blocks=1,
+            patch_size=2,
+            txt_embed_dim=16,
+            txt_max_length=5,
+            conditioning_mode=mode,
+            use_refine_head=True,
+            **head_kwargs,
+        )
+
+    @staticmethod
+    def _inputs(batch=2, size=8):
+        return (
+            torch.randn(batch, 3, size, size),
+            torch.full((batch,), 999.0),
+            torch.randn(batch, 5, 16),
+            torch.randn(batch, 3, size, size),
+        )
+
+    def test_head_is_identity_at_initialization(self):
+        torch.manual_seed(3)
+        plain = tiny_core("both")
+        torch.manual_seed(3)
+        refined = self._core("both")
+        missing, unexpected = refined.load_state_dict(plain.state_dict(), strict=False)
+        self.assertEqual(unexpected, [])
+        self.assertTrue(all(key.startswith("refine_head.") for key in missing))
+        self.assertTrue(missing, "expected the head to be the only new parameters")
+
+        x, t, y, condition = self._inputs()
+        with torch.no_grad():
+            self.assertTrue(
+                torch.equal(
+                    plain(x, t, y, condition_image=condition),
+                    refined(x, t, y, condition_image=condition),
+                )
+            )
+
+    def test_receptive_field_spans_a_patch_seam(self):
+        core = self._core("both")
+        head = core.refine_head
+        # A pixel must reach across at least one seam in every direction, so
+        # the field has to exceed patch_size rather than merely match it.
+        self.assertGreater(head.receptive_field, core.patch_size)
+
+        for parameter in head.parameters():
+            nn.init.constant_(parameter, 0.05)
+        probe = torch.zeros(1, head.in_channels, 41, 41, requires_grad=True)
+        head(probe)[0, :, 20, 20].sum().backward()
+        touched = (probe.grad.abs().sum(dim=(0, 1)) > 0).any(dim=1).nonzero().flatten()
+        measured = int(touched.max() - touched.min()) + 1
+        self.assertEqual(measured, head.receptive_field)
+
+    def test_zero_init_gates_gradient_like_a_lora_branch(self):
+        torch.manual_seed(5)
+        core = self._core("both")
+        # A freshly built core zero-inits final_layer; the pretrained checkpoint
+        # does not, and an identically zero output would mask the gradient.
+        nn.init.normal_(core.final_layer.linear.weight, std=0.02)
+        head = core.refine_head
+        x, t, y, condition = self._inputs()
+        target = torch.randn_like(x)
+
+        ((core(x, t, y, condition_image=condition) - target) ** 2).mean().backward()
+        with_gradient = {
+            name for name, p in head.named_parameters() if p.grad.abs().sum() > 0
+        }
+        self.assertEqual(with_gradient, {"body.8.weight", "body.8.bias"})
+
+        torch.optim.SGD(head.parameters(), lr=1.0).step()
+        head.zero_grad()
+        ((core(x, t, y, condition_image=condition) - target) ** 2).mean().backward()
+        self.assertTrue(all(p.grad.abs().sum() > 0 for p in head.parameters()))
+
+    def test_head_trains_in_full_and_survives_the_adapter_round_trip(self):
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                conditioning_mode="both",
+                conditioning_proj_init="zero",
+                sequence_rope_mode="aligned",
+                sequence_rope_offset=None,
+                use_sequence_type_embedding=True,
+                use_refine_head=True,
+                refine_head_width=8,
+                refine_head_dilations=[1, 2],
+            )
+        )
+        model = PixDiTTrainer(
+            image_size=8,
+            caption_channels=16,
+            model_max_length=5,
+            config=config,
+            extra={
+                "patch_size": 2,
+                "num_groups": 4,
+                "hidden_size": 32,
+                "pixel_hidden_size": 4,
+                "pixel_attn_hidden_size": 32,
+                "pixel_num_groups": 4,
+                "patch_depth": 1,
+                "pixel_depth": 1,
+                "txt_embed_dim": 16,
+                "txt_max_length": 5,
+            },
+        )
+        info = configure_matting_trainable_parameters(model, rank=2, alpha=2.0)
+        self.assertIsNotNone(info["refine_head"])
+        self.assertEqual(info["refine_head"]["dilations"], (1, 2))
+
+        head_parameters = {
+            name: parameter
+            for name, parameter in model.named_parameters()
+            if "refine_head" in name
+        }
+        self.assertTrue(head_parameters)
+        self.assertTrue(all(p.requires_grad for p in head_parameters.values()))
+        # Convolutions must not be LoRA-wrapped; the head has nothing to adapt.
+        self.assertFalse(any("refine_head" in name for name in info["target_modules"]))
+
+        with torch.no_grad():
+            for parameter in head_parameters.values():
+                parameter.add_(torch.randn_like(parameter) * 0.1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "adapter.pth")
+            save_adapter_checkpoint(path, model, info, step=1)
+            saved = torch.load(path, map_location="cpu")["adapter_state_dict"]
+            self.assertEqual(
+                {name for name in saved if "refine_head" in name},
+                set(head_parameters),
+            )
+            for parameter in head_parameters.values():
+                with torch.no_grad():
+                    parameter.zero_()
+            load_adapter_checkpoint(path, model)
+        for name, parameter in head_parameters.items():
+            self.assertTrue(torch.allclose(parameter, saved[name]), name)
+
+    def test_unconditioned_mode_builds_without_a_guide(self):
+        core = self._core("none")
+        self.assertEqual(core.refine_head.guide_channels, 0)
+        self.assertEqual(
+            core.refine_head.in_channels,
+            core.pixel_hidden_size + core.out_channels,
+        )
+        x, t, y, _ = self._inputs()
+        with torch.no_grad():
+            self.assertEqual(core(x, t, y).shape, x.shape)
+
+    def test_invalid_dilations_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self._core("both", refine_head_dilations=())
+        with self.assertRaises(ValueError):
+            self._core("both", refine_head_dilations=(1, 0))
+
+
+class Distinctions646Tests(unittest.TestCase):
+    """D-646 is where partial coverage actually lives, so the loader has to be
+    right before any transparency claim can be."""
+
+    @staticmethod
+    def _build_tree(root: Path, foregrounds=4, composites=5, size=8):
+        """A miniature pre-composited D-646: <fg>.png_<k> under merged/ and alpha/."""
+        train = root / "Train_comp"
+        for kind in ("merged", "alpha"):
+            (train / kind).mkdir(parents=True, exist_ok=True)
+        rng = np.random.RandomState(0)
+        for index in range(foregrounds):
+            for k in range(composites):
+                name = f"fg{index:04d}.png_{k}.png"
+                Image.fromarray(
+                    rng.randint(0, 255, (size, size, 3), dtype=np.uint8)
+                ).save(train / "merged" / name)
+                Image.fromarray(
+                    rng.randint(0, 255, (size, size), dtype=np.uint8), mode="L"
+                ).save(train / "alpha" / name)
+        test = root / "Test_comp"
+        for kind in ("merged", "alpha"):
+            (test / kind).mkdir(parents=True, exist_ok=True)
+        for index in range(3):
+            name = f"test_{index}.png"
+            Image.fromarray(rng.randint(0, 255, (size, size, 3), dtype=np.uint8)).save(
+                test / "merged" / name
+            )
+            Image.fromarray(rng.randint(0, 255, (size, size), dtype=np.uint8), mode="L").save(
+                test / "alpha" / name
+            )
+        return root
+
+    def _dataset(self, root, **extra):
+        options = {"split": "train"}
+        options.update(extra)
+        return Distinctions646MattingDataset(
+            data_dir=[str(root)], resolution=8, max_length=5, extra=options
+        )
+
+    def test_pairs_load_with_the_am2k_item_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            dataset = self._dataset(root)
+            self.assertEqual(len(dataset), 20)
+            self.assertEqual(dataset.foreground_count, 4)
+            item = dataset[0]
+            # Same tuple as AM2KMattingDataset so the training loop is unchanged.
+            self.assertEqual(len(item), 9)
+            alpha_rgb, _prompt, mask, data_info, _idx, _kind, sample_id, category, condition = item
+            self.assertEqual(alpha_rgb.shape, (3, 8, 8))
+            self.assertEqual(condition.shape, (3, 8, 8))
+            self.assertEqual(mask.shape, (1, 1, 5))
+            self.assertEqual(data_info["sample_id"], sample_id)
+            self.assertEqual(category, Distinctions646MattingDataset.foreground_key(sample_id))
+            for tensor in (alpha_rgb, condition):
+                self.assertGreaterEqual(tensor.min().item(), -1.0)
+                self.assertLessEqual(tensor.max().item(), 1.0)
+
+    def test_foreground_key_groups_composites(self):
+        key = Distinctions646MattingDataset.foreground_key
+        self.assertEqual(key("004c8d27c4063952a98616dd3c8ab316.png_0"), "004c8d27c4063952a98616dd3c8ab316")
+        self.assertEqual(key("004c8d27c4063952a98616dd3c8ab316.png_57"), "004c8d27c4063952a98616dd3c8ab316")
+        # Test composites share no foreground, so each is its own group.
+        self.assertEqual(key("test_0"), "test_0")
+
+    def test_overfit_subset_spreads_across_foregrounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            dataset = self._dataset(root, overfit_samples=4, overfit_seed=2025)
+            self.assertEqual(len(dataset), 4)
+            self.assertEqual(dataset.full_dataset_size, 20)
+            # Four samples out of four foregrounds must be one apiece; a uniform
+            # draw over 20 composites would not guarantee that.
+            self.assertEqual(len({record["category"] for record in dataset.dataset}), 4)
+
+    def test_subset_selection_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            first = self._dataset(root, overfit_samples=6, overfit_seed=7)
+            second = self._dataset(root, overfit_samples=6, overfit_seed=7)
+            other = self._dataset(root, overfit_samples=6, overfit_seed=8)
+            ids = lambda d: [r["sample_id"] for r in d.dataset]
+            self.assertEqual(ids(first), ids(second))
+            self.assertNotEqual(ids(first), ids(other))
+
+    def test_test_split_and_missing_data_are_handled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            self.assertEqual(len(self._dataset(root, split="test")), 3)
+            with self.assertRaises(ValueError):
+                self._dataset(root, split="validation")
+            # An alpha that went missing must be an error, not a silent skip.
+            (root / "Train_comp" / "alpha" / "fg0000.png_0.png").unlink()
+            with self.assertRaises(FileNotFoundError):
+                self._dataset(root)
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaises(FileNotFoundError):
+                self._dataset(Path(empty))
+
+    def test_shared_subset_helper_matches_the_am2k_method(self):
+        # AM2KMattingDataset keeps its own copy because trained adapters pin
+        # their subset by sample id; this guards the two from drifting.
+        records = [{"sample_id": f"s{i}", "category": f"c{i % 20}"} for i in range(1800)]
+        for seed in (2025, 7, 99):
+            for count in (16, 32, 64):
+                self.assertEqual(
+                    AM2KMattingDataset._category_stratified_subset(records, count, seed),
+                    _group_stratified_subset(records, count, seed, key="category"),
+                )
+
+
+class ReportLayoutTests(unittest.TestCase):
+    def test_layouts_cover_both_datasets(self):
+        from matting_report import DATASET_LAYOUTS, load_pair
+
+        self.assertEqual(DATASET_LAYOUTS["am2k"]["image"], ("original", ".jpg"))
+        self.assertEqual(DATASET_LAYOUTS["d646"]["image"], ("merged", ".png"))
+        self.assertEqual(DATASET_LAYOUTS["d646"]["splits"]["train"], "Train_comp")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Distinctions646Tests._build_tree(Path(directory))
+            image, alpha = load_pair(root, "train", "fg0000.png_0", 8, DATASET_LAYOUTS["d646"])
+            self.assertEqual(image.size, (8, 8))
+            self.assertEqual(alpha.shape, (8, 8))
+            self.assertTrue(0.0 <= alpha.min() and alpha.max() <= 1.0)
+            with self.assertRaises(FileNotFoundError):
+                load_pair(root, "train", "nope", 8, DATASET_LAYOUTS["d646"])
 
 
 if __name__ == "__main__":

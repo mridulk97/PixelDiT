@@ -1,0 +1,115 @@
+data:
+  data_dir: [/scratch/mridul/data/matting/distinctions-646]
+  image_size: 1024
+  type: Distinctions646MattingDataset
+  load_text_feat: false
+  transform: default_train
+  extra:
+    # Composites are named <foreground>.png_<k>, and the overfit subset is
+    # stratified by foreground so 32 samples come from 32 distinct objects
+    # rather than 32 views of a handful.
+    split: train
+    overfit_samples: 32
+    overfit_seed: 2025
+    default_prompt: Transform to matting map while maintaining original composition
+
+model:
+  model: PixDiTTrainer
+  image_size: 1024
+  mixed_precision: bf16
+  fp32_attention: true
+  load_from:
+  multi_scale: false
+  class_dropout_prob: 0.0
+  conditioning_mode: both
+  conditioning_proj_init: zero
+  # Pixel-resolution refinement over the folded output: the only module that
+  # couples neighbouring pixels across a 16px patch seam. Off by default so the
+  # existing baselines stay reproducible; enable per-run with
+  # --model.use_refine_head=true. Dilations give a receptive field of
+  # 1 + 2 * (sum + 1) = 17px, one wider than a patch.
+  use_refine_head: false
+  refine_head_width: 64
+  refine_head_dilations: [1, 2, 4, 1]
+  sequence_rope_mode: aligned
+  sequence_rope_offset:
+  use_sequence_type_embedding: true
+  extra:
+    patch_size: 16
+    num_groups: 24
+    hidden_size: 1536
+    pixel_hidden_size: 16
+    pixel_attn_hidden_size: 1152
+    pixel_num_groups: 16
+    patch_depth: 14
+    pixel_depth: 2
+    num_text_blocks: 4
+    txt_embed_dim: 2304
+    txt_max_length: 300
+    use_text_rope: true
+    text_rope_theta: 10000.0
+    repa_encoder_index: -1
+
+text_encoder:
+  text_encoder_name: gemma-2-2b-it
+  caption_channels: 2304
+  model_max_length: 300
+  chi_prompt: []
+
+scheduler:
+  train_sampling_steps: 1000
+  predict_flow_v: true
+  noise_schedule: linear_flow
+  pred_sigma: false
+  learn_sigma: false
+  flow_shift: 4.0
+  # Zero input at the top of the schedule, single-step decode. Removes the
+  # denoising shortcut that let earlier runs reach low loss while ignoring the
+  # conditioning image. Set false to reproduce the stochastic-flow runs.
+  deterministic_flow: true
+  weighting_scheme: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+  vis_sampler: flow_dpm-solver
+
+train:
+  num_workers: 8
+  seed: 2025
+  train_batch_size: 16
+  num_epochs: 1000
+  max_train_steps: 20000
+  gradient_accumulation_steps: 1
+  grad_checkpointing: true
+  gradient_clip: 1.0
+  # Trimap-band matting losses on top of the whole-image term. At step 1,550 of
+  # the deterministic `both` run the band held 96.4% of the squared error while
+  # covering 8.8% of pixels, so uniform MSE had almost nothing left to say.
+  matting_band_loss_weight: 1.0
+  matting_band_sad_weight: 1.0
+  matting_band_mse_weight: 1.0
+  matting_band_grad_weight: 1.0
+  matting_band_radius_min: 10
+  matting_band_radius_max: 40
+  matting_band_warmup_steps: 200
+  lora_rank: 16
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  adapter_save_steps: 100
+  log_interval: 10
+  wandb_log_images: true
+  wandb_image_interval: 50
+  wandb_sampling_steps: 20
+  wandb_num_examples: 4
+  repa_loss_weight: 0.0
+  ema_update: false
+  optimizer:
+    type: AdamW
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+    weight_decay: 0.0
+
+work_dir: /scratch/mridul/runs/matting/v1/pixeldit-matting-am2k-both
+report_to: wandb
+tracker_project_name: pixeldit-matting
+name: pixeldit-matting-am2k-overfit

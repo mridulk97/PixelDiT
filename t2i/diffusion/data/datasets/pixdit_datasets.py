@@ -371,6 +371,200 @@ class AM2KMattingDataset(Dataset):
         )
 
 
+def _group_stratified_subset(records, count, seed, key="category"):
+    """Round-robin across groups so a small subset spans them evenly.
+
+    Same procedure as ``AM2KMattingDataset._category_stratified_subset``, but
+    keyed on any field. That method is deliberately left alone: trained
+    adapters pin their AM-2K selection by sample id, and a refactor that
+    perturbed it would silently invalidate them.
+    """
+    if count > len(records):
+        raise ValueError(f"overfit_samples={count} exceeds dataset size {len(records)}")
+    rng = random.Random(seed)
+    buckets = {}
+    for record in records:
+        buckets.setdefault(record[key], []).append(record)
+    groups = sorted(buckets)
+    rng.shuffle(groups)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+    selected = []
+    offset = 0
+    while len(selected) < count:
+        made_progress = False
+        for group in groups:
+            bucket = buckets[group]
+            if offset < len(bucket):
+                selected.append(bucket[offset])
+                made_progress = True
+                if len(selected) == count:
+                    break
+        if not made_progress:
+            break
+        offset += 1
+    return selected
+
+
+@DATASETS.register_module()
+class Distinctions646MattingDataset(Dataset):
+    """Pre-composited RGB/alpha pairs from Distinctions-646.
+
+    AM-2K is 2,000 natural animal photographs whose mattes are only 0.7-3.9%
+    soft pixels, so a model can score well on it while doing nothing useful
+    with partial coverage. D-646 is the opposite: 646 foregrounds -- glass,
+    water, veils, smoke, fine hair -- each composited over many backgrounds,
+    which is where transparency actually lives.
+
+    Layout is the pre-composited release, matching the paths in
+    Edit2Perceive's ``data_split/Distinctions_matting`` lists::
+
+        <root>/Train_comp/merged/<foreground>.png_<k>.png
+        <root>/Train_comp/alpha/<foreground>.png_<k>.png
+        <root>/Test_comp/merged/test_<i>.png
+        <root>/Test_comp/alpha/test_<i>.png
+
+    Composites are already on disk, so this loader stays a plain paired reader
+    like the AM-2K one; no foreground/background compositing happens here.
+    """
+
+    SPLIT_DIRS = {"train": "Train_comp", "test": "Test_comp"}
+
+    def __init__(
+        self,
+        data_dir="",
+        transform=None,
+        resolution=1024,
+        max_length=300,
+        config=None,
+        extra=None,
+        **kwargs,
+    ):
+        del transform, kwargs
+        options = extra or {}
+        if not isinstance(options, dict):
+            options = vars(options)
+        roots = data_dir if isinstance(data_dir, list) else [data_dir]
+        if len(roots) != 1:
+            raise ValueError("Distinctions646MattingDataset expects exactly one data root")
+        self.root = osp.abspath(osp.expanduser(str(roots[0])))
+        self.split = str(options.get("split", "train"))
+        if self.split not in self.SPLIT_DIRS:
+            raise ValueError("Distinctions-646 split must be 'train' or 'test'")
+        self.resolution = int(resolution)
+        self.max_length = int(max_length)
+        self.default_prompt = str(
+            options.get(
+                "default_prompt",
+                "Transform to matting map while maintaining original composition",
+            )
+        )
+        self.overfit_samples = int(options.get("overfit_samples", 0) or 0)
+        self.overfit_seed = int(options.get("overfit_seed", 2025))
+        self.load_text_feat = False
+
+        split_dir = osp.join(self.root, self.SPLIT_DIRS[self.split])
+        merged_dir = osp.join(split_dir, "merged")
+        alpha_dir = osp.join(split_dir, "alpha")
+        if not osp.isdir(merged_dir) or not osp.isdir(alpha_dir):
+            raise FileNotFoundError(
+                f"Distinctions-646 is not extracted: expected {merged_dir} and {alpha_dir}. "
+                "Run `bash setup_d646_data.sh` first."
+            )
+
+        records = []
+        missing_alpha = []
+        for name in sorted(os.listdir(merged_dir)):
+            if not name.lower().endswith(".png"):
+                continue
+            alpha_path = osp.join(alpha_dir, name)
+            if not osp.isfile(alpha_path):
+                missing_alpha.append(name)
+                continue
+            sample_id = name[: -len(".png")]
+            records.append(
+                {
+                    "sample_id": sample_id,
+                    # Every composite of one foreground shares this key. The
+                    # 596 training foregrounds fan out into tens of thousands
+                    # of composites, so a uniform subset would happily draw the
+                    # same foreground repeatedly and overfit far too easily.
+                    "category": self.foreground_key(sample_id),
+                    "image_path": osp.join(merged_dir, name),
+                    "alpha_path": alpha_path,
+                }
+            )
+        if missing_alpha:
+            raise FileNotFoundError(
+                f"{len(missing_alpha)} Distinctions-646 {self.split} composites have no alpha, "
+                f"first few: {missing_alpha[:5]}"
+            )
+        if not records:
+            raise RuntimeError(f"No Distinctions-646 {self.split} pairs found under {split_dir}")
+
+        self.full_dataset_size = len(records)
+        self.foreground_count = len({record["category"] for record in records})
+        if self.overfit_samples > 0:
+            records = _group_stratified_subset(
+                records, self.overfit_samples, self.overfit_seed, key="category"
+            )
+        self.dataset = records
+        self.ori_imgs_nums = len(self.dataset)
+        self.logger = (
+            get_root_logger()
+            if config is None
+            else get_root_logger(osp.join(config.work_dir, "train_log.log"))
+        )
+        self.logger.info(
+            f"Distinctions-646 {self.split}: using {len(self.dataset)}/{self.full_dataset_size} "
+            f"paired composites from {self.foreground_count} foregrounds "
+            f"at {self.resolution}x{self.resolution}"
+        )
+
+    @staticmethod
+    def foreground_key(sample_id):
+        """Identity of the foreground a composite came from.
+
+        Training composites are named ``<foreground>.png_<k>``; test composites
+        are ``test_<i>`` with no shared foreground, so each is its own group.
+        """
+        marker = ".png_"
+        return sample_id.split(marker)[0] if marker in sample_id else sample_id
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        record = self.dataset[idx]
+        image = Image.open(record["image_path"]).convert("RGB")
+        alpha = Image.open(record["alpha_path"]).convert("L")
+        target_size = (self.resolution, self.resolution)
+        image = image.resize(target_size, Image.Resampling.BICUBIC)
+        alpha = alpha.resize(target_size, Image.Resampling.BILINEAR)
+
+        condition = T.ToTensor()(image) * 2.0 - 1.0
+        alpha_tensor = T.ToTensor()(alpha) * 2.0 - 1.0
+        alpha_rgb = alpha_tensor.repeat(3, 1, 1)
+        attention_mask = torch.ones(1, 1, self.max_length, dtype=torch.int16)
+        data_info = {
+            "img_hw": torch.tensor([self.resolution, self.resolution], dtype=torch.float32),
+            "aspect_ratio": torch.tensor(1.0),
+            "sample_id": record["sample_id"],
+            "category": record["category"],
+        }
+        return (
+            alpha_rgb,
+            self.default_prompt,
+            attention_mask,
+            data_info,
+            idx,
+            "prompt",
+            record["sample_id"],
+            record["category"],
+            condition,
+        )
+
+
 @DATASETS.register_module()
 class PixDiTWebDataset(Dataset):
     """WebDataset-based pixel-space loader."""
