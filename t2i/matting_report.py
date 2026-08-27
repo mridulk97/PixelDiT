@@ -58,8 +58,7 @@ from matting_inference import (
 from tools.download import resolve_checkpoint
 
 
-# Where each dataset keeps its RGB/alpha pairs. Both are plain paired readers:
-# D-646 ships pre-composited, so nothing is composited here either.
+# Where each dataset's RGB/alpha pairs come from.
 DATASET_LAYOUTS = {
     "am2k": {
         "root": "/scratch/mridul/data/matting/am-2k",
@@ -69,9 +68,11 @@ DATASET_LAYOUTS = {
     },
     "d646": {
         "root": "/scratch/mridul/data/matting/distinctions-646",
-        "splits": {"train": "Train_comp", "test": "Test_comp"},
-        "image": ("merged", ".png"),
-        "alpha": ("alpha", ".png"),
+        "splits": {"train": "Train", "test": "Test"},
+        # D-646 ships foregrounds and alphas, not composites, so pairs come
+        # from the dataset class rather than from a path template. Using the
+        # loader itself guarantees the report sees exactly what training saw.
+        "composite": True,
     },
 }
 
@@ -103,6 +104,11 @@ def parse_args():
         "--data_root",
         default=None,
         help="Dataset root (defaults to the layout's standard path)",
+    )
+    parser.add_argument(
+        "--background_dir",
+        default=None,
+        help="Background pool for d646 compositing (defaults to the dataset's COCO/VOC paths)",
     )
     parser.add_argument(
         "--split",
@@ -152,7 +158,56 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_sample_ids(args, metadata, layout, data_root: Path) -> List[str]:
+class CompositeSource:
+    """Pairs from Distinctions646MattingDataset, composited the way it does.
+
+    Building the report's ground truth any other way would risk disagreeing
+    with what the model was trained on.
+    """
+
+    def __init__(self, data_root: Path, split: str, resolution: int, background_dir=None):
+        from diffusion.data.datasets.pixdit_datasets import Distinctions646MattingDataset
+
+        extra = {"split": split, "cache_composites": False}
+        if background_dir:
+            extra["background_dir"] = str(background_dir)
+        self.dataset = Distinctions646MattingDataset(
+            data_dir=[str(data_root)], resolution=resolution, extra=extra
+        )
+
+    def sample_ids(self) -> List[str]:
+        return [record["sample_id"] for record in self.dataset.dataset]
+
+    def load(self, sample_id: str, size: int):
+        return self.dataset.load_pair(sample_id, size)
+
+
+class PairedSource:
+    """Pairs read straight off disk, for datasets that ship composited."""
+
+    def __init__(self, data_root: Path, split: str, layout):
+        self.data_root = data_root
+        self.split = split
+        self.layout = layout
+
+    def sample_ids(self) -> List[str]:
+        image_dir, suffix = self.layout["image"]
+        directory = self.data_root / self.layout["splits"][self.split] / image_dir
+        if not directory.is_dir():
+            raise FileNotFoundError(f"No such split directory: {directory}")
+        return sorted(path.stem for path in directory.glob(f"*{suffix}"))
+
+    def load(self, sample_id: str, size: int):
+        return load_pair(self.data_root, self.split, sample_id, size, self.layout)
+
+
+def build_pair_source(layout, data_root: Path, split: str, resolution: int, background_dir=None):
+    if layout.get("composite"):
+        return CompositeSource(data_root, split, resolution, background_dir)
+    return PairedSource(data_root, split, layout)
+
+
+def resolve_sample_ids(args, metadata, source) -> List[str]:
     """Prefer the ids the adapter actually trained on over re-deriving them.
 
     A run records its subset in the checkpoint, so a report stays correct even
@@ -163,12 +218,7 @@ def resolve_sample_ids(args, metadata, layout, data_root: Path) -> List[str]:
     recorded = metadata.get("subset_sample_ids")
     if recorded and args.split == "train":
         return list(recorded)
-    split_dir = layout["splits"][args.split]
-    image_dir, suffix = layout["image"]
-    directory = data_root / split_dir / image_dir
-    if not directory.is_dir():
-        raise FileNotFoundError(f"No such split directory: {directory}")
-    return sorted(path.stem for path in directory.glob(f"*{suffix}"))
+    return source.sample_ids()
 
 
 def load_pair(data_root: Path, split: str, sample_id: str, size: int, layout=None):
@@ -418,7 +468,8 @@ def main():
             f"expected one of {sorted(layout['splits'])}"
         )
     data_root = Path(args.data_root or layout["root"])
-    sample_ids = resolve_sample_ids(args, metadata, layout, data_root)
+    source = build_pair_source(layout, data_root, args.split, image_size, args.background_dir)
+    sample_ids = resolve_sample_ids(args, metadata, source)
     if args.limit > 0:
         sample_ids = sample_ids[: args.limit]
     output_dir = Path(args.output_dir)
@@ -437,7 +488,7 @@ def main():
     accumulated_error = np.zeros((image_size, image_size), dtype=np.float64)
 
     for index, sample_id in enumerate(sample_ids, start=1):
-        image, target = load_pair(data_root, args.split, sample_id, image_size, layout)
+        image, target = source.load(sample_id, image_size)
         condition = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0)
         condition = (condition.permute(2, 0, 1) * 2.0 - 1.0).unsqueeze(0)
         condition = condition.to(device=device, dtype=weight_dtype)

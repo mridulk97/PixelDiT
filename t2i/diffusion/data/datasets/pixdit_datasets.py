@@ -20,6 +20,7 @@ import getpass
 import hashlib
 import io
 import json
+import math
 import os
 import os.path as osp
 import random
@@ -408,27 +409,51 @@ def _group_stratified_subset(records, count, seed, key="category"):
 
 @DATASETS.register_module()
 class Distinctions646MattingDataset(Dataset):
-    """Pre-composited RGB/alpha pairs from Distinctions-646.
+    """Distinctions-646, composited on the fly.
 
-    AM-2K is 2,000 natural animal photographs whose mattes are only 0.7-3.9%
-    soft pixels, so a model can score well on it while doing nothing useful
-    with partial coverage. D-646 is the opposite: 646 foregrounds -- glass,
-    water, veils, smoke, fine hair -- each composited over many backgrounds,
-    which is where transparency actually lives.
+    AM-2K mattes are 0.7-3.9% soft pixels, so a model can reach
+    ``generated_mse`` 0.0002 there while doing nothing useful with partial
+    coverage. D-646 is 646 foregrounds -- glass, water, veils, smoke, fine hair
+    -- and it is where transparency actually lives.
 
-    Layout is the pre-composited release, matching the paths in
-    Edit2Perceive's ``data_split/Distinctions_matting`` lists::
+    The release ships foregrounds and alphas, not composites::
 
-        <root>/Train_comp/merged/<foreground>.png_<k>.png
-        <root>/Train_comp/alpha/<foreground>.png_<k>.png
-        <root>/Test_comp/merged/test_<i>.png
-        <root>/Test_comp/alpha/test_<i>.png
+        <root>/Train/FG/<name>.png   596 foregrounds
+        <root>/Train/GT/<name>.png   596 alphas, 1:1 with FG
+        <root>/Train/bg_train.txt    59,600 COCO background names
+        <root>/Test/{FG,GT}          50 pairs
+        <root>/Test/bg_test.txt      1,000 VOC background names
 
-    Composites are already on disk, so this loader stays a plain paired reader
-    like the AM-2K one; no foreground/background compositing happens here.
+    Its ``gen_train.py`` writes every composite to disk -- 59,600 PNGs, around
+    100 GB. This composites at ``__getitem__`` instead, following that script
+    exactly: the background is upscaled only if it does not already cover the
+    foreground, cropped to the foreground's shape, and blended as
+    ``alpha * fg + (1 - alpha) * bg`` at native resolution before the pair is
+    resized. Compositing before the resize matters -- alpha blending is not
+    linear through downsampling, and the difference lands precisely on the soft
+    edges this dataset exists to exercise.
+
+    Backgrounds are assigned by position, exactly as ``gen_train.py`` walks its
+    list, so foreground *i* always takes backgrounds
+    ``[i * num_backgrounds, (i + 1) * num_backgrounds)`` and sample
+    ``<fg>_<k>`` is byte-identical on every epoch. An overfit subset is
+    meaningless otherwise.
     """
 
-    SPLIT_DIRS = {"train": "Train_comp", "test": "Test_comp"}
+    SPLITS = {
+        "train": {"dir": "Train", "bg_list": "bg_train.txt"},
+        "test": {"dir": "Test", "bg_list": "bg_test.txt"},
+    }
+    # COCO train2014 filenames encode the same image ids as train2017, so a
+    # 2017 checkout serves the 2014 list once the prefix is dropped.
+    BACKGROUND_ALIASES = ("COCO_train2014_", "COCO_val2014_")
+    DEFAULT_BACKGROUND_DIRS = {
+        "train": "/projects/ml4science/PSG_Data/coco/train2017",
+        "test": (
+            "/projects/ml4science/kazi/PartSegmentationDatasets/"
+            "Pascal_VOC_2012/VOCdevkit/VOC2012/JPEGImages"
+        ),
+    }
 
     def __init__(
         self,
@@ -449,7 +474,7 @@ class Distinctions646MattingDataset(Dataset):
             raise ValueError("Distinctions646MattingDataset expects exactly one data root")
         self.root = osp.abspath(osp.expanduser(str(roots[0])))
         self.split = str(options.get("split", "train"))
-        if self.split not in self.SPLIT_DIRS:
+        if self.split not in self.SPLITS:
             raise ValueError("Distinctions-646 split must be 'train' or 'test'")
         self.resolution = int(resolution)
         self.max_length = int(max_length)
@@ -463,53 +488,86 @@ class Distinctions646MattingDataset(Dataset):
         self.overfit_seed = int(options.get("overfit_seed", 2025))
         self.load_text_feat = False
 
-        split_dir = osp.join(self.root, self.SPLIT_DIRS[self.split])
-        merged_dir = osp.join(split_dir, "merged")
-        alpha_dir = osp.join(split_dir, "alpha")
-        if not osp.isdir(merged_dir) or not osp.isdir(alpha_dir):
+        # Compositing costs ~1.6s a sample: foregrounds run to 24 megapixels and
+        # the blend happens at native resolution. An overfit run replays the
+        # same handful every epoch, so caching the resized result keeps the GPU
+        # fed; full training sees each composite once, where a cache only wastes
+        # memory. Cached as uint8, about 4 MB a sample.
+        cache_option = options.get("cache_composites")
+        self.cache_composites = (
+            bool(cache_option) if cache_option is not None else self.overfit_samples > 0
+        )
+        self.max_cached = int(options.get("max_cached_composites", 256))
+        self._composite_cache = {}
+
+        spec = self.SPLITS[self.split]
+        split_dir = osp.join(self.root, spec["dir"])
+        self.foreground_dir = osp.join(split_dir, "FG")
+        self.alpha_dir = osp.join(split_dir, "GT")
+        if not osp.isdir(self.foreground_dir) or not osp.isdir(self.alpha_dir):
             raise FileNotFoundError(
-                f"Distinctions-646 is not extracted: expected {merged_dir} and {alpha_dir}. "
-                "Run `bash setup_d646_data.sh` first."
+                f"Distinctions-646 is not extracted: expected {self.foreground_dir} and "
+                f"{self.alpha_dir}. Run `bash setup_d646_data.sh` first."
             )
 
-        records = []
-        missing_alpha = []
-        for name in sorted(os.listdir(merged_dir)):
-            if not name.lower().endswith(".png"):
-                continue
-            alpha_path = osp.join(alpha_dir, name)
-            if not osp.isfile(alpha_path):
-                missing_alpha.append(name)
-                continue
-            sample_id = name[: -len(".png")]
-            records.append(
-                {
-                    "sample_id": sample_id,
-                    # Every composite of one foreground shares this key. The
-                    # 596 training foregrounds fan out into tens of thousands
-                    # of composites, so a uniform subset would happily draw the
-                    # same foreground repeatedly and overfit far too easily.
-                    "category": self.foreground_key(sample_id),
-                    "image_path": osp.join(merged_dir, name),
-                    "alpha_path": alpha_path,
-                }
-            )
+        foregrounds = sorted(
+            name for name in os.listdir(self.foreground_dir) if name.lower().endswith(".png")
+        )
+        missing_alpha = [n for n in foregrounds if not osp.isfile(osp.join(self.alpha_dir, n))]
         if missing_alpha:
             raise FileNotFoundError(
-                f"{len(missing_alpha)} Distinctions-646 {self.split} composites have no alpha, "
+                f"{len(missing_alpha)} Distinctions-646 {self.split} foregrounds have no alpha, "
                 f"first few: {missing_alpha[:5]}"
             )
-        if not records:
-            raise RuntimeError(f"No Distinctions-646 {self.split} pairs found under {split_dir}")
+        if not foregrounds:
+            raise RuntimeError(f"No Distinctions-646 foregrounds under {self.foreground_dir}")
+
+        self.background_dir = str(
+            options.get("background_dir") or self.DEFAULT_BACKGROUND_DIRS[self.split]
+        )
+        if not osp.isdir(self.background_dir):
+            raise FileNotFoundError(
+                f"Background directory not found: {self.background_dir}. Set "
+                "data.extra.background_dir to a directory of background images."
+            )
+        self.background_names = self._read_background_list(osp.join(split_dir, spec["bg_list"]))
+
+        requested = options.get("num_backgrounds")
+        if requested:
+            self.num_backgrounds = int(requested)
+        elif self.background_names:
+            # 59,600 / 596 = 100 for train; 1,000 / 50 = 20 for test.
+            self.num_backgrounds = max(1, len(self.background_names) // len(foregrounds))
+        else:
+            self.num_backgrounds = 1
+
+        records = []
+        for index, name in enumerate(foregrounds):
+            stem = name[: -len(".png")]
+            for k in range(self.num_backgrounds):
+                records.append(
+                    {
+                        # Official naming from gen_train.py: <fg>_<k>.
+                        "sample_id": f"{stem}_{k}",
+                        # Every composite of one foreground shares this key, so
+                        # a small subset can be spread across distinct objects
+                        # rather than repeat views of a handful.
+                        "category": stem,
+                        "foreground_path": osp.join(self.foreground_dir, name),
+                        "alpha_path": osp.join(self.alpha_dir, name),
+                        "background": self._background_for(index, k),
+                    }
+                )
 
         self.full_dataset_size = len(records)
-        self.foreground_count = len({record["category"] for record in records})
+        self.foreground_count = len(foregrounds)
         if self.overfit_samples > 0:
             records = _group_stratified_subset(
                 records, self.overfit_samples, self.overfit_seed, key="category"
             )
         self.dataset = records
         self.ori_imgs_nums = len(self.dataset)
+        self._records_by_id = {record["sample_id"]: record for record in records}
         self.logger = (
             get_root_logger()
             if config is None
@@ -517,34 +575,117 @@ class Distinctions646MattingDataset(Dataset):
         )
         self.logger.info(
             f"Distinctions-646 {self.split}: using {len(self.dataset)}/{self.full_dataset_size} "
-            f"paired composites from {self.foreground_count} foregrounds "
-            f"at {self.resolution}x{self.resolution}"
+            f"composites from {self.foreground_count} foregrounds x {self.num_backgrounds} "
+            f"backgrounds at {self.resolution}x{self.resolution}"
+        )
+
+    @staticmethod
+    def _read_background_list(path):
+        """Background filenames, in order. The shipped lists are CRLF."""
+        if not osp.isfile(path):
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return [line.strip() for line in handle if line.strip()]
+
+    def _background_for(self, foreground_index, k):
+        """Resolve one background path the way gen_train.py walks its list."""
+        if self.background_names:
+            position = foreground_index * self.num_backgrounds + k
+            name = self.background_names[position % len(self.background_names)]
+        else:
+            name = None
+        return name
+
+    def _background_path(self, name):
+        if name is None:
+            raise RuntimeError("No background list; set data.extra.background_dir")
+        candidates = [name]
+        for alias in self.BACKGROUND_ALIASES:
+            if name.startswith(alias):
+                candidates.append(name[len(alias) :])
+        for candidate in candidates:
+            path = osp.join(self.background_dir, candidate)
+            if osp.isfile(path):
+                return path
+        raise FileNotFoundError(
+            f"Background {name!r} not found in {self.background_dir} (tried {candidates})"
         )
 
     @staticmethod
     def foreground_key(sample_id):
-        """Identity of the foreground a composite came from.
+        """Identity of the foreground a composite came from: ``<fg>_<k>`` -> ``<fg>``."""
+        head, separator, tail = sample_id.rpartition("_")
+        return head if separator and tail.isdigit() else sample_id
 
-        Training composites are named ``<foreground>.png_<k>``; test composites
-        are ``test_<i>`` with no shared foreground, so each is its own group.
+    def composite(self, record):
+        """One composite at native resolution, following gen_train.py.
+
+        Returns a PIL RGB image and a float32 alpha in ``[0, 1]``.
         """
-        marker = ".png_"
-        return sample_id.split(marker)[0] if marker in sample_id else sample_id
+        foreground = Image.open(record["foreground_path"]).convert("RGB")
+        alpha_image = Image.open(record["alpha_path"]).convert("L")
+        if alpha_image.size != foreground.size:
+            alpha_image = alpha_image.resize(foreground.size, Image.Resampling.BILINEAR)
+        width, height = foreground.size
+
+        background = Image.open(self._background_path(record["background"])).convert("RGB")
+        # Upscale only when the background does not already cover the
+        # foreground, then take the top-left crop -- gen_train.py's `bg[0:w, 0:h]`.
+        ratio = max(width / background.size[0], height / background.size[1])
+        if ratio > 1:
+            background = background.resize(
+                (math.ceil(background.size[0] * ratio), math.ceil(background.size[1] * ratio)),
+                Image.Resampling.BICUBIC,
+            )
+        background = background.crop((0, 0, width, height))
+
+        alpha = np.asarray(alpha_image, dtype=np.float32)[..., None] / 255.0
+        merged = alpha * np.asarray(foreground, dtype=np.float32) + (1.0 - alpha) * np.asarray(
+            background, dtype=np.float32
+        )
+        return Image.fromarray(np.clip(merged, 0, 255).astype(np.uint8)), alpha[..., 0]
+
+    def load_pair(self, sample_id, resolution=None):
+        """Composite one sample by id and resize it, for evaluation tooling."""
+        record = self._records_by_id.get(sample_id)
+        if record is None:
+            raise KeyError(f"Unknown Distinctions-646 sample: {sample_id}")
+        size = int(resolution or self.resolution)
+        key = (sample_id, size)
+        cached = self._composite_cache.get(key)
+        if cached is not None:
+            image_array, alpha_array = cached
+            return Image.fromarray(image_array), alpha_array.astype(np.float32) / 255.0
+
+        image, alpha = self.composite(record)
+        image = image.resize((size, size), Image.Resampling.BICUBIC)
+        alpha_uint8 = np.asarray(
+            Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L").resize(
+                (size, size), Image.Resampling.BILINEAR
+            ),
+            dtype=np.uint8,
+        )
+        if self.cache_composites and len(self._composite_cache) < self.max_cached:
+            self._composite_cache[key] = (np.asarray(image, dtype=np.uint8), alpha_uint8)
+        return image, alpha_uint8.astype(np.float32) / 255.0
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        image, alpha = self.load_pair(self.dataset[idx]["sample_id"])
         record = self.dataset[idx]
-        image = Image.open(record["image_path"]).convert("RGB")
-        alpha = Image.open(record["alpha_path"]).convert("L")
-        target_size = (self.resolution, self.resolution)
-        image = image.resize(target_size, Image.Resampling.BICUBIC)
-        alpha = alpha.resize(target_size, Image.Resampling.BILINEAR)
 
-        condition = T.ToTensor()(image) * 2.0 - 1.0
-        alpha_tensor = T.ToTensor()(alpha) * 2.0 - 1.0
-        alpha_rgb = alpha_tensor.repeat(3, 1, 1)
+        # Numerically identical to `T.ToTensor()(image) * 2 - 1`, but it does not
+        # hand a 3 MB elementwise op to torch's intra-op pool. That matters
+        # wherever this runs outside a DataLoader worker -- workers pin
+        # torch to one thread, the main process does not, and on a 128-core
+        # node the dispatch overhead alone costs most of a second per image.
+        condition = torch.from_numpy(
+            np.ascontiguousarray(np.asarray(image, dtype=np.float32) / 255.0)
+        ).permute(2, 0, 1) * 2.0 - 1.0
+        alpha_tensor = torch.from_numpy(alpha)[None] * 2.0 - 1.0
+        alpha_rgb = alpha_tensor.expand(3, -1, -1).contiguous()
         attention_mask = torch.ones(1, 1, self.max_length, dtype=torch.int16)
         data_info = {
             "img_hw": torch.tensor([self.resolution, self.resolution], dtype=torch.float32),
@@ -563,6 +704,7 @@ class Distinctions646MattingDataset(Dataset):
             record["category"],
             condition,
         )
+
 
 
 @DATASETS.register_module()

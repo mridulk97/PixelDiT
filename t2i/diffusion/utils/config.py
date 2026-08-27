@@ -190,6 +190,11 @@ class TrainingConfig(BaseConfig):
     adapter_save_steps: int = 100
     wandb_log_images: bool = False
     wandb_image_interval: int = 100
+    # Rotate which samples the preview grid shows, so a run is not judged on
+    # the same four images for thousands of steps. The headline
+    # validation/generated_mse stays on a fixed set regardless, so its curve
+    # remains comparable across steps and across runs.
+    wandb_preview_rotate: bool = True
     wandb_sampling_steps: int = 20
     wandb_num_examples: int = 1
     log_interval: int = 50

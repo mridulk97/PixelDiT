@@ -3,10 +3,14 @@
 # Put Distinctions-646 on disk in the layout Distinctions646MattingDataset
 # expects, and keep it there.
 #
-#   <root>/Train_comp/merged/<foreground>.png_<k>.png
-#   <root>/Train_comp/alpha/<foreground>.png_<k>.png
-#   <root>/Test_comp/merged/test_<i>.png
-#   <root>/Test_comp/alpha/test_<i>.png
+#   <root>/Train/FG/<name>.png    596 foregrounds
+#   <root>/Train/GT/<name>.png    596 alphas, 1:1 with FG
+#   <root>/Train/bg_train.txt     59,600 COCO background names
+#   <root>/Test/{FG,GT}            50 pairs
+#   <root>/Test/bg_test.txt       1,000 VOC background names
+#
+# Composites are built on the fly by Distinctions646MattingDataset, so the
+# 59,600 PNGs (~100 GB) gen_train.py would write never land on disk.
 #
 # Idempotent, like setup_am2k_data.sh: run it before every session and it only
 # re-stamps timestamps when the data is already complete.
@@ -20,14 +24,9 @@
 #
 # THE ARCHIVE IS RAR5
 #
-# Distinctions-646 ships as a .rar, and this cluster has no extractor: no
-# unrar, unar, 7z or bsdtar on PATH, none in the conda env, and no matching
-# module. Install one before running this, for example:
-#
-#   conda install -c conda-forge libarchive   # provides bsdtar, reads RAR5
-#   conda install -c conda-forge p7zip        # provides 7z
-#
-# `pip install rarfile` is not enough on its own -- it shells out to unrar.
+# Distinctions-646 ships as a .rar. Miniconda bundles bsdtar (libarchive),
+# which reads RAR5, but activating an env drops base conda's bin from PATH --
+# so this script looks there explicitly before giving up.
 #
 # Usage:
 #   bash setup_d646_data.sh              # extract if needed, verify, refresh mtimes
@@ -54,24 +53,63 @@ while (( $# )); do
   shift
 done
 
-# Count merged/alpha pairs in one split. Prints "<paired> <merged> <alpha>".
+# Count FG/GT pairs in one split. Prints "<paired> <fg> <gt>".
 count_pairs() {
   local dir="$root/$1"
-  local merged=0 alpha=0 paired=0
-  if [[ -d "$dir/merged" ]]; then
-    merged=$(find "$dir/merged" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+  local fg=0 gt=0 paired=0
+  if [[ -d "$dir/FG" ]]; then
+    fg=$(find "$dir/FG" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
   fi
-  if [[ -d "$dir/alpha" ]]; then
-    alpha=$(find "$dir/alpha" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+  if [[ -d "$dir/GT" ]]; then
+    gt=$(find "$dir/GT" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
   fi
-  if (( merged > 0 && alpha > 0 )); then
+  if (( fg > 0 && gt > 0 )); then
     # A pair needs the same filename under both directories; comparing sorted
     # name lists catches a partial extract that counting alone would not.
     paired=$(comm -12 \
-      <(find "$dir/merged" -maxdepth 1 -name '*.png' -type f -printf '%f\n' | sort) \
-      <(find "$dir/alpha"  -maxdepth 1 -name '*.png' -type f -printf '%f\n' | sort) | wc -l)
+      <(find "$dir/FG" -maxdepth 1 -name '*.png' -type f -printf '%f\n' | sort) \
+      <(find "$dir/GT" -maxdepth 1 -name '*.png' -type f -printf '%f\n' | sort) | wc -l)
   fi
-  echo "$paired $merged $alpha"
+  echo "$paired $fg $gt"
+}
+
+# Where the composites' backgrounds come from. Everything the shipped
+# bg_*.txt lists name is already on this cluster: the COCO train2014 filenames
+# encode the same image ids as train2017, and all 59,600 resolve there.
+COCO_DIR="${D646_COCO_DIR:-/projects/ml4science/PSG_Data/coco/train2017}"
+VOC_DIR="${D646_VOC_DIR:-/projects/ml4science/kazi/PartSegmentationDatasets/Pascal_VOC_2012/VOCdevkit/VOC2012/JPEGImages}"
+
+check_backgrounds() {
+  local split="$1" dir="$2" list="$root/$1/$3" ok=1
+  if [[ ! -d "$dir" ]]; then
+    echo "  $split backgrounds: MISSING directory $dir" >&2
+    return 1
+  fi
+  if [[ ! -f "$list" ]]; then
+    echo "  $split backgrounds: MISSING list $list" >&2
+    return 1
+  fi
+  # The shipped lists are CRLF, so strip \r before probing.
+  local total present name
+  total=$(tr -d '\r' < "$list" | grep -c . || true)
+  present=0
+  # A file whose last line has no trailing newline loses that line to a plain
+  # `read`; bg_train.txt is exactly that.
+  while IFS= read -r name || [[ -n "$name" ]]; do
+    name="${name%$'\r'}"
+    [[ -z "$name" ]] && continue
+    if [[ -f "$dir/$name" || -f "$dir/${name#COCO_train2014_}" ]]; then
+      present=$((present + 1))
+    fi
+    # Probing 59,600 names costs a second; sampling would hide a partial set.
+  done < "$list"
+  if (( present < total )); then
+    echo "  $split backgrounds: $present/$total found in $dir" >&2
+    ok=0
+  else
+    echo "  $split backgrounds: $present/$total  ok"
+  fi
+  (( ok ))
 }
 
 find_extractor() {
@@ -82,6 +120,15 @@ find_extractor() {
       return 0
     fi
   done
+  # Activating a conda env removes base conda's bin from PATH, and that is
+  # where bsdtar lives on this cluster.
+  local base
+  for base in "${CONDA_EXE%/bin/conda}" /apps/common/software/Miniconda3/24.7.1-0; do
+    if [[ -n "$base" && -x "$base/bin/bsdtar" ]]; then
+      echo "$base/bin/bsdtar"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -89,10 +136,10 @@ extract_archive() {
   local tool
   if ! tool="$(find_extractor)"; then
     cat >&2 <<'EOF'
-No RAR extractor found (looked for bsdtar, 7z, 7za, unar, unrar).
+No RAR extractor found (looked for bsdtar, 7z, 7za, unar, unrar on PATH, and
+for bsdtar in base conda).
 
-Distinctions-646 ships as a RAR5 archive. Install one of these into the active
-environment, then re-run this script:
+Distinctions-646 ships as a RAR5 archive. Install one of these, then re-run:
 
     conda install -c conda-forge libarchive   # bsdtar, reads RAR5
     conda install -c conda-forge p7zip        # 7z
@@ -105,13 +152,18 @@ EOF
     echo "Archive not found: $archive (set D646_ARCHIVE)" >&2
     return 1
   fi
-  echo "  extracting with $tool: $(basename "$archive")"
+  echo "  extracting with $(basename "$tool"): $(basename "$archive")"
   mkdir -p "$root"
-  case "$tool" in
-    bsdtar)     bsdtar -x -f "$archive" -C "$root" ;;
+  # Only FG, GT and the background lists are needed; the PDF and the original
+  # generation scripts are not.
+  case "$(basename "$tool")" in
+    bsdtar)     "$tool" -x -f "$archive" -C "$root" \
+                  'Distinctions-646/Train/FG/*' 'Distinctions-646/Train/GT/*' \
+                  'Distinctions-646/Test/FG/*'  'Distinctions-646/Test/GT/*'  \
+                  'Distinctions-646/*/*.txt' ;;
     7z|7za)     "$tool" x -y -o"$root" "$archive" >/dev/null ;;
-    unar)       unar -quiet -force-overwrite -output-directory "$root" "$archive" ;;
-    unrar)      unrar x -y "$archive" "$root/" >/dev/null ;;
+    unar)       "$tool" -quiet -force-overwrite -output-directory "$root" "$archive" ;;
+    unrar)      "$tool" x -y "$archive" "$root/" >/dev/null ;;
   esac
 }
 
@@ -119,7 +171,7 @@ EOF
 # to $root so the dataset's paths resolve.
 normalise_layout() {
   local found
-  for split in Train_comp Test_comp; do
+  for split in Train Test; do
     [[ -d "$root/$split" ]] && continue
     found="$(find "$root" -maxdepth 3 -type d -name "$split" 2>/dev/null | head -1)"
     if [[ -n "$found" && "$found" != "$root/$split" ]]; then
@@ -136,7 +188,7 @@ refresh_timestamps() {
 
 echo "Distinctions-646 root: $root"
 
-if [[ "$mode" == "force" ]] || [[ ! -d "$root/Train_comp/merged" ]] || [[ ! -d "$root/Test_comp/merged" ]]; then
+if [[ "$mode" == "force" ]] || [[ ! -d "$root/Train/FG" ]] || [[ ! -d "$root/Test/FG" ]]; then
   if [[ "$mode" == "check" ]]; then
     echo "  not extracted" >&2
     echo "Distinctions-646 is NOT ready." >&2
@@ -146,26 +198,37 @@ if [[ "$mode" == "force" ]] || [[ ! -d "$root/Train_comp/merged" ]] || [[ ! -d "
   normalise_layout
 fi
 
+declare -A EXPECTED=( [Train]=596 [Test]=50 )
 status=0
-for split in Train_comp Test_comp; do
-  read -r paired merged alpha <<<"$(count_pairs "$split")"
+for split in Train Test; do
+  read -r paired fg gt <<<"$(count_pairs "$split")"
   if (( paired == 0 )); then
-    echo "  $split: no pairs (merged=$merged alpha=$alpha)" >&2
+    echo "  $split: no FG/GT pairs (FG=$fg GT=$gt)" >&2
     status=1
     continue
   fi
-  if (( merged != paired || alpha != paired )); then
-    echo "  $split: $paired pairs, but merged=$merged alpha=$alpha -- extract is incomplete" >&2
+  if (( fg != paired || gt != paired )); then
+    echo "  $split: $paired pairs, but FG=$fg GT=$gt -- extract is incomplete" >&2
+    status=1
+    continue
+  fi
+  if (( paired != EXPECTED[$split] )); then
+    echo "  $split: $paired pairs, expected ${EXPECTED[$split]}" >&2
     status=1
     continue
   fi
   if [[ "$mode" == "check" ]]; then
-    echo "  $split: $paired pairs  ok"
+    echo "  $split: $paired FG/GT pairs  ok"
   else
     refresh_timestamps "$split"
-    echo "  $split: $paired pairs  ok (timestamps refreshed)"
+    echo "  $split: $paired FG/GT pairs  ok (timestamps refreshed)"
   fi
 done
+
+# Composites are built at load time, so the background pools are part of the
+# dataset being "ready" even though nothing here extracts them.
+check_backgrounds Train "$COCO_DIR" bg_train.txt || status=1
+check_backgrounds Test  "$VOC_DIR"  bg_test.txt  || status=1
 
 if (( status != 0 )); then
   echo "Distinctions-646 is NOT ready." >&2

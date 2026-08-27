@@ -39,6 +39,7 @@ from diffusion.model.matting_losses import (
 )
 from train_matting import (
     _band_loss_scale,
+    _rotating_preview_indices,
     _fires_on,
     _decode_deterministic,
     _deterministic_inputs,
@@ -884,95 +885,133 @@ class Distinctions646Tests(unittest.TestCase):
     right before any transparency claim can be."""
 
     @staticmethod
-    def _build_tree(root: Path, foregrounds=4, composites=5, size=8):
-        """A miniature pre-composited D-646: <fg>.png_<k> under merged/ and alpha/."""
-        train = root / "Train_comp"
-        for kind in ("merged", "alpha"):
-            (train / kind).mkdir(parents=True, exist_ok=True)
+    def _build_tree(root: Path, foregrounds=4, backgrounds=8, size=8):
+        """A miniature D-646: FG/GT pairs plus a background list, as shipped."""
         rng = np.random.RandomState(0)
-        for index in range(foregrounds):
-            for k in range(composites):
-                name = f"fg{index:04d}.png_{k}.png"
-                Image.fromarray(
-                    rng.randint(0, 255, (size, size, 3), dtype=np.uint8)
-                ).save(train / "merged" / name)
-                Image.fromarray(
-                    rng.randint(0, 255, (size, size), dtype=np.uint8), mode="L"
-                ).save(train / "alpha" / name)
-        test = root / "Test_comp"
-        for kind in ("merged", "alpha"):
-            (test / kind).mkdir(parents=True, exist_ok=True)
-        for index in range(3):
-            name = f"test_{index}.png"
-            Image.fromarray(rng.randint(0, 255, (size, size, 3), dtype=np.uint8)).save(
-                test / "merged" / name
+        for split, count in (("Train", foregrounds), ("Test", 2)):
+            for kind in ("FG", "GT"):
+                (root / split / kind).mkdir(parents=True, exist_ok=True)
+            names = [f"fg{i:03d}.png" for i in range(count)]
+            for name in names:
+                Image.fromarray(rng.randint(0, 255, (size, size, 3), dtype=np.uint8)).save(
+                    root / split / "FG" / name
+                )
+                Image.fromarray(rng.randint(0, 255, (size, size), dtype=np.uint8), mode="L").save(
+                    root / split / "GT" / name
+                )
+            listing = root / split / ("bg_train.txt" if split == "Train" else "bg_test.txt")
+            per = backgrounds if split == "Train" else 2
+            # Shipped lists are CRLF and end without a trailing newline.
+            listing.write_bytes(
+                "\r\n".join(f"bg{i:03d}.jpg" for i in range(count * per)).encode()
             )
-            Image.fromarray(rng.randint(0, 255, (size, size), dtype=np.uint8), mode="L").save(
-                test / "alpha" / name
+        backgrounds_dir = root / "backgrounds"
+        backgrounds_dir.mkdir(exist_ok=True)
+        for i in range(foregrounds * backgrounds):
+            Image.fromarray(rng.randint(0, 255, (size // 2, size // 2, 3), dtype=np.uint8)).save(
+                backgrounds_dir / f"bg{i:03d}.jpg"
             )
         return root
 
     def _dataset(self, root, **extra):
-        options = {"split": "train"}
+        options = {"split": "train", "background_dir": str(Path(root) / "backgrounds")}
         options.update(extra)
         return Distinctions646MattingDataset(
             data_dir=[str(root)], resolution=8, max_length=5, extra=options
         )
 
-    def test_pairs_load_with_the_am2k_item_shape(self):
+    def test_composites_have_the_am2k_item_shape(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._build_tree(Path(directory))
             dataset = self._dataset(root)
-            self.assertEqual(len(dataset), 20)
             self.assertEqual(dataset.foreground_count, 4)
+            self.assertEqual(dataset.num_backgrounds, 8)
+            self.assertEqual(len(dataset), 32)
             item = dataset[0]
-            # Same tuple as AM2KMattingDataset so the training loop is unchanged.
             self.assertEqual(len(item), 9)
-            alpha_rgb, _prompt, mask, data_info, _idx, _kind, sample_id, category, condition = item
+            alpha_rgb, _p, mask, info, _i, _k, sample_id, category, condition = item
             self.assertEqual(alpha_rgb.shape, (3, 8, 8))
             self.assertEqual(condition.shape, (3, 8, 8))
             self.assertEqual(mask.shape, (1, 1, 5))
-            self.assertEqual(data_info["sample_id"], sample_id)
+            self.assertEqual(info["sample_id"], sample_id)
             self.assertEqual(category, Distinctions646MattingDataset.foreground_key(sample_id))
             for tensor in (alpha_rgb, condition):
                 self.assertGreaterEqual(tensor.min().item(), -1.0)
                 self.assertLessEqual(tensor.max().item(), 1.0)
 
+    def test_composite_matches_the_alpha_blend(self):
+        """alpha * fg + (1 - alpha) * bg, exactly as gen_train.py does it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            dataset = self._dataset(root)
+            record = dataset.dataset[0]
+            image, alpha = dataset.composite(record)
+            foreground = np.asarray(Image.open(record["foreground_path"]).convert("RGB"), np.float32)
+            background = Image.open(dataset._background_path(record["background"])).convert("RGB")
+            width, height = foreground.shape[1], foreground.shape[0]
+            ratio = max(width / background.size[0], height / background.size[1])
+            if ratio > 1:
+                background = background.resize(
+                    (int(np.ceil(background.size[0] * ratio)), int(np.ceil(background.size[1] * ratio))),
+                    Image.Resampling.BICUBIC,
+                )
+            background = np.asarray(background.crop((0, 0, width, height)), np.float32)
+            expected = alpha[..., None] * foreground + (1 - alpha[..., None]) * background
+            self.assertTrue(np.allclose(np.asarray(image, np.float32), np.clip(expected, 0, 255).astype(np.uint8), atol=1))
+
+    def test_background_assignment_is_positional_and_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            dataset = self._dataset(root)
+            # gen_train.py walks the list in order: foreground i takes
+            # backgrounds [i * num_backgrounds, (i + 1) * num_backgrounds).
+            self.assertEqual(dataset.dataset[0]["background"], "bg000.jpg")
+            self.assertEqual(dataset.dataset[1]["background"], "bg001.jpg")
+            self.assertEqual(dataset.dataset[8]["background"], "bg008.jpg")
+            # An overfit subset is meaningless if a sample changes between epochs.
+            again = self._dataset(root)
+            self.assertTrue(torch.equal(dataset[3][0], again[3][0]))
+            self.assertTrue(torch.equal(dataset[3][8], again[3][8]))
+
+    def test_crlf_background_list_without_trailing_newline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._build_tree(Path(directory))
+            dataset = self._dataset(root)
+            self.assertEqual(len(dataset.background_names), 32)
+            self.assertTrue(all("\r" not in name for name in dataset.background_names))
+
     def test_foreground_key_groups_composites(self):
         key = Distinctions646MattingDataset.foreground_key
-        self.assertEqual(key("004c8d27c4063952a98616dd3c8ab316.png_0"), "004c8d27c4063952a98616dd3c8ab316")
-        self.assertEqual(key("004c8d27c4063952a98616dd3c8ab316.png_57"), "004c8d27c4063952a98616dd3c8ab316")
-        # Test composites share no foreground, so each is its own group.
-        self.assertEqual(key("test_0"), "test_0")
+        self.assertEqual(key("004c8d27c4063952a98616dd3c8ab316_0"), "004c8d27c4063952a98616dd3c8ab316")
+        self.assertEqual(key("h_29_9"), "h_29")
+        self.assertEqual(key("13(2)_57"), "13(2)")
 
     def test_overfit_subset_spreads_across_foregrounds(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._build_tree(Path(directory))
             dataset = self._dataset(root, overfit_samples=4, overfit_seed=2025)
             self.assertEqual(len(dataset), 4)
-            self.assertEqual(dataset.full_dataset_size, 20)
-            # Four samples out of four foregrounds must be one apiece; a uniform
-            # draw over 20 composites would not guarantee that.
+            self.assertEqual(dataset.full_dataset_size, 32)
             self.assertEqual(len({record["category"] for record in dataset.dataset}), 4)
+            self.assertTrue(dataset.cache_composites)  # small subset, replayed every epoch
 
-    def test_subset_selection_is_deterministic(self):
+    def test_cache_is_off_for_full_training_and_exact_when_on(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._build_tree(Path(directory))
-            first = self._dataset(root, overfit_samples=6, overfit_seed=7)
-            second = self._dataset(root, overfit_samples=6, overfit_seed=7)
-            other = self._dataset(root, overfit_samples=6, overfit_seed=8)
-            ids = lambda d: [r["sample_id"] for r in d.dataset]
-            self.assertEqual(ids(first), ids(second))
-            self.assertNotEqual(ids(first), ids(other))
+            self.assertFalse(self._dataset(root).cache_composites)
+            cached = self._dataset(root, overfit_samples=4, cache_composites=True)
+            first = cached[0][0].clone()
+            self.assertTrue(torch.equal(cached[0][0], first))
 
-    def test_test_split_and_missing_data_are_handled(self):
+    def test_missing_pieces_are_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._build_tree(Path(directory))
-            self.assertEqual(len(self._dataset(root, split="test")), 3)
+            self.assertEqual(len(self._dataset(root, split="test")), 4)
             with self.assertRaises(ValueError):
                 self._dataset(root, split="validation")
-            # An alpha that went missing must be an error, not a silent skip.
-            (root / "Train_comp" / "alpha" / "fg0000.png_0.png").unlink()
+            with self.assertRaises(FileNotFoundError):
+                self._dataset(root, background_dir=str(Path(directory) / "nope"))
+            (root / "Train" / "GT" / "fg000.png").unlink()
             with self.assertRaises(FileNotFoundError):
                 self._dataset(root)
         with tempfile.TemporaryDirectory() as empty:
@@ -992,21 +1031,39 @@ class Distinctions646Tests(unittest.TestCase):
 
 
 class ReportLayoutTests(unittest.TestCase):
-    def test_layouts_cover_both_datasets(self):
-        from matting_report import DATASET_LAYOUTS, load_pair
+    def test_layouts_and_sources_cover_both_datasets(self):
+        from matting_report import DATASET_LAYOUTS, build_pair_source
 
         self.assertEqual(DATASET_LAYOUTS["am2k"]["image"], ("original", ".jpg"))
-        self.assertEqual(DATASET_LAYOUTS["d646"]["image"], ("merged", ".png"))
-        self.assertEqual(DATASET_LAYOUTS["d646"]["splits"]["train"], "Train_comp")
+        self.assertTrue(DATASET_LAYOUTS["d646"]["composite"])
+        self.assertEqual(DATASET_LAYOUTS["d646"]["splits"]["train"], "Train")
 
         with tempfile.TemporaryDirectory() as directory:
             root = Distinctions646Tests._build_tree(Path(directory))
-            image, alpha = load_pair(root, "train", "fg0000.png_0", 8, DATASET_LAYOUTS["d646"])
+            source = build_pair_source(DATASET_LAYOUTS["d646"], root, "train", 8, root / "backgrounds")
+            ids = source.sample_ids()
+            self.assertEqual(len(ids), 32)
+            image, alpha = source.load(ids[0], 8)
             self.assertEqual(image.size, (8, 8))
             self.assertEqual(alpha.shape, (8, 8))
-            self.assertTrue(0.0 <= alpha.min() and alpha.max() <= 1.0)
-            with self.assertRaises(FileNotFoundError):
-                load_pair(root, "train", "nope", 8, DATASET_LAYOUTS["d646"])
+            self.assertTrue(0.0 <= float(alpha.min()) and float(alpha.max()) <= 1.0)
+
+            paired = build_pair_source(DATASET_LAYOUTS["am2k"], root, "train", 8)
+            self.assertFalse(hasattr(paired, "dataset"))
+
+
+class PreviewRotationTests(unittest.TestCase):
+    def test_rotation_varies_by_step_without_repeating_within_a_grid(self):
+        grids = [_rotating_preview_indices(32, 4, step) for step in (50, 100, 150, 200)]
+        for grid in grids:
+            self.assertEqual(len(set(grid)), 4)
+            self.assertTrue(all(0 <= index < 32 for index in grid))
+        self.assertEqual(len({tuple(grid) for grid in grids}), 4)
+
+    def test_rotation_is_reproducible_and_clamped(self):
+        self.assertEqual(_rotating_preview_indices(32, 4, 50), _rotating_preview_indices(32, 4, 50))
+        # Asking for more examples than exist must not raise.
+        self.assertEqual(len(_rotating_preview_indices(3, 8, 1)), 3)
 
 
 if __name__ == "__main__":
