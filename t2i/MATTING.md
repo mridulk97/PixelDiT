@@ -18,8 +18,8 @@ Each selects its config and runs its own setup script before launching.
 | content | 2,000 natural animal photographs | 646 foregrounds composited over many backgrounds |
 | soft pixels | 0.7–3.9% of frame | much higher — this is the point |
 | transparency | none; water is labelled background | glass, water, veils, smoke, fine hair |
-| layout | `train/original` + `train/mask` | `Train_comp/merged` + `Train_comp/alpha` |
-| splits | `train` (1800), `validation` (200) | `train`, `test` |
+| layout | `train/original` + `train/mask` | `Train/FG` + `Train/GT` + a background list |
+| splits | `train` (1800), `validation` (200) | `train` (596 fg x 100 bg), `test` (50 x 20) |
 
 **Why D-646 matters.** AM-2K mattes are near-binary animal silhouettes, so a
 model can score `generated_mse` 0.0002 there while predicting nothing useful for
@@ -28,17 +28,34 @@ that, with MAD 30–56x higher in the soft region than in the hard one. D-646 is
 where that failure becomes visible in the headline number rather than only in a
 diagnostic.
 
-D-646 ships pre-composited, in the same layout Edit2Perceive's
-`data_split/Distinctions_matting` lists use, so `Distinctions646MattingDataset`
-is a plain paired reader like the AM-2K one; no foreground/background
-compositing happens at load time.
+**D-646 ships foregrounds and alphas, not composites.** Its `gen_train.py`
+writes every composite to disk — 59,600 PNGs, roughly 100 GB.
+`Distinctions646MattingDataset` composites at `__getitem__` instead, following
+that script exactly: the background is upscaled only if it does not already
+cover the foreground, cropped to the foreground's shape, and blended as
+`alpha * fg + (1 - alpha) * bg` at **native resolution**, before the pair is
+resized. Compositing before the resize matters — alpha blending is not linear
+through downsampling, and the difference lands precisely on the soft edges this
+dataset exists to exercise.
 
-One difference that matters: training composites are named
-`<foreground>.png_<k>`, so tens of thousands of composites come from only a few
-hundred foregrounds. The overfit subset is stratified by **foreground identity**
-rather than sampled uniformly, so 32 samples come from 32 distinct objects
-instead of repeat views of a handful. (At 32 the gain is modest — a uniform draw
-happened to give 30 distinct — but it grows with subset size.)
+Backgrounds are assigned by position, exactly as `gen_train.py` walks its list,
+so foreground *i* always takes backgrounds `[i*100, (i+1)*100)` and sample
+`<fg>_<k>` is byte-identical on every epoch. An overfit subset is meaningless
+otherwise.
+
+Composites cost about a second each (foregrounds run to 24 megapixels), so the
+resized result is cached when `overfit_samples > 0` — a small subset is replayed
+every epoch, and the cache takes it to 10 ms. Full training sees each composite
+once, where a cache would only waste memory, so it is off there. Override with
+`data.extra.cache_composites`.
+
+Measured soft-pixel share over eight training composites: **median 6.9%, max
+61.4%**, against AM-2K's 0.67–3.93%. That is the reason to run this dataset.
+
+The overfit subset is stratified by **foreground identity**, so 32 samples come
+from 32 distinct objects rather than repeat views of a handful. (At 32 the gain
+is modest — a uniform draw happened to give 30 distinct — but it grows with
+subset size.)
 
 ### AM-2K
 
@@ -85,23 +102,32 @@ bash setup_d646_data.sh --check      # verify only, change nothing
 bash setup_d646_data.sh --force      # re-extract regardless
 ```
 
-Same contract as the AM-2K script: idempotent, verifies that every `merged/`
-file has a matching `alpha/`, and re-stamps timestamps for the same
-scratch-cleanup reason. `D646_ROOT` and `D646_ARCHIVE` override the paths.
+Same contract as the AM-2K script: idempotent, verifies every FG has a matching
+GT, and re-stamps timestamps for the same scratch-cleanup reason. `D646_ROOT`
+and `D646_ARCHIVE` override the paths.
 
-**It needs a RAR extractor that is not currently installed.** Distinctions-646
-ships as a RAR5 archive, and this cluster has no `unrar`, `unar`, `7z` or
-`bsdtar` on `PATH`, none in the conda env, and no module that provides one. The
-script looks for all four and stops with instructions if none is found. Install
-one first:
+It also verifies the **background pools**, because composites are built at load
+time and the dataset is not usable without them. Everything the shipped
+`bg_*.txt` lists name is already on this cluster:
 
-```bash
-conda install -c conda-forge libarchive   # provides bsdtar, reads RAR5
-conda install -c conda-forge p7zip        # provides 7z
-```
+| | source | coverage |
+| --- | --- | --- |
+| train | `/projects/ml4science/PSG_Data/coco/train2017` | 59,600 / 59,600 |
+| test | `.../Pascal_VOC_2012/VOCdevkit/VOC2012/JPEGImages` | 1,000 / 1,000 |
 
-`pip install rarfile` is not sufficient on its own — it shells out to an
-`unrar` binary.
+COCO train2014 filenames encode the same image ids as train2017, so the 2014
+list resolves against a 2017 checkout once the prefix is dropped. Override with
+`D646_COCO_DIR` / `D646_VOC_DIR`, or per-run with
+`data.extra.background_dir`.
+
+Two things about the shipped lists worth knowing, since both produced wrong
+answers before they were handled: they are **CRLF**, and `bg_train.txt` has **no
+trailing newline**, so a plain `while read` loop silently drops its last entry.
+
+The archive is **RAR5**. Miniconda bundles `bsdtar` (libarchive), which reads it
+— but activating a conda env drops base conda's `bin` from `PATH`, so the script
+looks there explicitly before giving up. Extraction takes about two and a half
+minutes and pulls only `FG`, `GT` and the background lists.
 
 ## Conditioning ablations
 
@@ -291,6 +317,15 @@ By default, every launch creates a timestamped directory under:
 ```text
 /scratch/mridul/runs/matting/v2/pixeldit-matting-am2k-<mode>_<YYYYmmdd_HHMMSS>/
 ```
+
+By default the preview grid **rotates** which samples it shows: at each preview
+step it draws a fresh set, seeded by the step so a re-run shows the same images
+at the same points, and without replacement so one grid never repeats a sample.
+The sample ids go in the W&B image caption. `validation/generated_mse` stays on
+a **fixed** batch regardless, so its curve remains comparable across steps and
+across runs; the rotating set is reported separately as
+`validation/preview_generated_mse`. Set `--train.wandb_preview_rotate=false` for
+the old fixed-four behaviour.
 
 That directory contains the training log, deterministic subset manifest, adapter checkpoints, generated preview grids, and the local W&B run files. W&B logs the gradient-accumulated flow loss every 10 optimizer steps. Every 100 steps it logs correct/shuffled validation losses and a fixed-seed grid whose columns are `input RGB | generated alpha | ground-truth alpha`.
 

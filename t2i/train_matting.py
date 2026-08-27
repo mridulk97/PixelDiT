@@ -6,13 +6,14 @@ import json
 import logging
 import os
 import os.path as osp
+import random
 from dataclasses import asdict
 from pathlib import Path
 
 import pyrallis
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 from torchvision.utils import make_grid, save_image
 
 from diffusion import DPMS, Scheduler
@@ -238,6 +239,21 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, conf
 
 
 @torch.no_grad()
+def _rotating_preview_indices(dataset_size, num_examples, global_step):
+    """A different slice of the subset at each preview.
+
+    Seeded by step, so re-running a job shows the same images at the same
+    points, and drawn without replacement so one grid never repeats a sample.
+    """
+    count = max(1, min(int(num_examples), int(dataset_size)))
+    return random.Random(int(global_step)).sample(range(int(dataset_size)), count)
+
+
+def _collate_indices(dataset, indices):
+    """Build a preview batch from arbitrary dataset indices."""
+    return default_collate([dataset[index] for index in indices])
+
+
 def _sample_training_grid(
     model,
     batch,
@@ -636,16 +652,43 @@ def main(config: PixDiTConfig) -> None:
                         )
                     if should_preview and wandb_run is not None:
                         try:
-                            grid, generated_mse = _sample_training_grid(
+                            num_examples = max(1, int(config.train.wandb_num_examples))
+                            preview_batch = validation_batch
+                            preview_ids = list(validation_batch[6][:num_examples])
+                            if config.train.wandb_preview_rotate and len(dataset) > num_examples:
+                                indices = _rotating_preview_indices(
+                                    len(dataset), num_examples, global_step
+                                )
+                                preview_batch = _collate_indices(dataset, indices)
+                                preview_ids = list(preview_batch[6])
+                            grid, preview_mse = _sample_training_grid(
                                 unwrapped,
-                                validation_batch,
+                                preview_batch,
                                 prompt_embeddings,
                                 prompt_mask,
                                 config.train.wandb_sampling_steps,
                                 config.scheduler.flow_shift,
-                                max(1, int(config.train.wandb_num_examples)),
+                                num_examples,
                                 config,
                             )
+                            if preview_batch is validation_batch:
+                                generated_mse = preview_mse
+                            else:
+                                # Keep the headline metric on the fixed batch so
+                                # its curve stays comparable across steps and
+                                # runs; a rotating one would move with whichever
+                                # samples happened to be drawn.
+                                _, generated_mse = _sample_training_grid(
+                                    unwrapped,
+                                    validation_batch,
+                                    prompt_embeddings,
+                                    prompt_mask,
+                                    config.train.wandb_sampling_steps,
+                                    config.scheduler.flow_shift,
+                                    num_examples,
+                                    config,
+                                )
+                                validation_log["validation/preview_generated_mse"] = preview_mse
                             preview_dir = Path(config.work_dir) / "previews"
                             preview_dir.mkdir(parents=True, exist_ok=True)
                             preview_path = preview_dir / f"step_{global_step}.png"
@@ -653,7 +696,10 @@ def main(config: PixDiTConfig) -> None:
                             validation_log["validation/generated_mse"] = generated_mse
                             validation_log["validation/examples"] = wandb_api.Image(
                                 str(preview_path),
-                                caption="Columns: input RGB | generated alpha | ground-truth alpha",
+                                caption=(
+                                    "Columns: input RGB | generated alpha | ground-truth alpha"
+                                    f" -- {', '.join(str(name) for name in preview_ids)}"
+                                ),
                             )
                         except torch.cuda.OutOfMemoryError:
                             LOGGER.exception(
