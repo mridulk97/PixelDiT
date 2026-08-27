@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import os
@@ -40,6 +41,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        help="Run the forward under autocast at model.mixed_precision (faster, less exact)",
+    )
     parser.add_argument(
         "--shuffle_conditions",
         action="store_true",
@@ -136,6 +142,13 @@ def _apply_adapter_metadata(config, metadata):
     config.model.sequence_rope_offset = metadata.get("sequence_rope_offset")
     config.model.use_sequence_type_embedding = metadata.get("use_sequence_type_embedding", True)
     config.model.conditioning_proj_init = metadata.get("conditioning_proj_init", "zero")
+    # The head's weights live in the adapter, so the architecture has to be
+    # rebuilt exactly or the adapter will not load onto it.
+    config.model.use_refine_head = bool(metadata.get("use_refine_head", False))
+    config.model.refine_head_width = int(metadata.get("refine_head_width", 64))
+    config.model.refine_head_dilations = list(
+        metadata.get("refine_head_dilations", [1, 2, 4, 1])
+    )
     config.scheduler.deterministic_flow = bool(metadata.get("deterministic_flow", False))
     if int(metadata.get("image_size", config.model.image_size)) != int(config.model.image_size):
         raise RuntimeError("Adapter and inference config image sizes do not match")
@@ -157,7 +170,21 @@ def main():
     _apply_adapter_metadata(config, metadata)
 
     device = torch.device(args.device)
-    weight_dtype = get_weight_dtype(config.model.mixed_precision)
+    # `Accelerator(mixed_precision=...)` keeps master weights in fp32 and only
+    # casts per-op inside autocast; the training preview then runs
+    # `accelerator.unwrap_model(model)` with no autocast context, so it is pure
+    # fp32. Match that. Casting the weights to bf16 -- which this script used to
+    # do -- is a different computation and collapses the model to a constant
+    # matte: MSE 0.41-0.51 against 0.0002 in fp32, on the same checkpoints.
+    weight_dtype = torch.float32
+    autocast_dtype = get_weight_dtype(config.model.mixed_precision) if args.autocast else None
+    if autocast_dtype is torch.float32:
+        autocast_dtype = None
+
+    def forward_context():
+        if autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=device.type, dtype=autocast_dtype)
     base_path = resolve_checkpoint(args.model_path or metadata.get("base_checkpoint") or "pixeldit_t2i_v1.pth")
     model = build_model(
         config.model.model,
@@ -167,7 +194,13 @@ def main():
     )
     result = model.load_state_dict(_base_state_dict(base_path), strict=False)
     allowed_missing = {"core.reference_type_embedding", "core.target_type_embedding"}
-    missing = [name for name in result.missing_keys if name not in allowed_missing]
+    # The refinement head is new, so the base checkpoint carries none of it; its
+    # weights arrive from the adapter a few lines below.
+    missing = [
+        name
+        for name in result.missing_keys
+        if name not in allowed_missing and not name.startswith("core.refine_head.")
+    ]
     if missing or result.unexpected_keys:
         raise RuntimeError(f"Base checkpoint mismatch: missing={missing}, unexpected={result.unexpected_keys}")
 
@@ -212,13 +245,14 @@ def main():
                 device=device,
                 dtype=torch.long,
             )
-            velocity = model(
-                zeros,
-                timesteps,
-                caption_embeddings,
-                mask=caption_mask,
-                condition_image=condition,
-            )
+            with forward_context():
+                velocity = model(
+                    zeros,
+                    timesteps,
+                    caption_embeddings,
+                    mask=caption_mask,
+                    condition_image=condition,
+                )
             if isinstance(velocity, dict):
                 velocity = velocity["x"]
             sample = -velocity
@@ -260,14 +294,15 @@ def main():
             schedule="FLOW",
             interval_guidance=[0, 1],
         )
-        sample = solver.sample(
-            noise,
-            steps=args.steps,
-            order=2,
-            skip_type="time_uniform_flow",
-            method="multistep",
-            flow_shift=config.scheduler.flow_shift,
-        )
+        with forward_context():
+            sample = solver.sample(
+                noise,
+                steps=args.steps,
+                order=2,
+                skip_type="time_uniform_flow",
+                method="multistep",
+                flow_shift=config.scheduler.flow_shift,
+            )
         alpha = ((sample.float() + 1.0) * 0.5).mean(dim=1)[0].clamp(0.0, 1.0).cpu().numpy()
         npy_path = output_dir / f"{target_path.stem}.npy"
         png_path = output_dir / f"{target_path.stem}.png"
