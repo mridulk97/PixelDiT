@@ -393,7 +393,13 @@ def main(config: PixDiTConfig) -> None:
     base_checkpoint = resolve_checkpoint(config.model.load_from or "pixeldit_t2i_v1.pth")
     load_result = model.load_state_dict(_checkpoint_state_dict(base_checkpoint), strict=False)
     allowed_missing = {"core.reference_type_embedding", "core.target_type_embedding"}
-    disallowed_missing = [key for key in load_result.missing_keys if key not in allowed_missing]
+    # The refinement head is new, so the base checkpoint carries none of it.
+    allowed_missing_prefixes = ("core.refine_head.",)
+    disallowed_missing = [
+        key
+        for key in load_result.missing_keys
+        if key not in allowed_missing and not key.startswith(allowed_missing_prefixes)
+    ]
     if disallowed_missing or load_result.unexpected_keys:
         raise RuntimeError(
             f"Base checkpoint mismatch. Missing={disallowed_missing}, "
@@ -670,6 +676,9 @@ def main(config: PixDiTConfig) -> None:
                             "sequence_rope_offset": config.model.sequence_rope_offset,
                             "use_sequence_type_embedding": config.model.use_sequence_type_embedding,
                             "conditioning_proj_init": config.model.conditioning_proj_init,
+                            "use_refine_head": config.model.use_refine_head,
+                            "refine_head_width": config.model.refine_head_width,
+                            "refine_head_dilations": list(config.model.refine_head_dilations),
                             "deterministic_flow": config.scheduler.deterministic_flow,
                             "matting_band_loss_weight": config.train.matting_band_loss_weight,
                             "prompt": prompt,

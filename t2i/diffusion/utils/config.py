@@ -86,6 +86,12 @@ class ModelConfig(BaseConfig):
     sequence_rope_mode: str = "aligned"
     sequence_rope_offset: Optional[float] = None
     use_sequence_type_embedding: bool = True
+    # Pixel-resolution refinement head. Dilations set the receptive field:
+    # 1 + 2 * (sum(dilations) + 1), so the default (1, 2, 4, 1) reaches 17px,
+    # one wider than a 16px patch.
+    use_refine_head: bool = False
+    refine_head_width: int = 64
+    refine_head_dilations: List[int] = field(default_factory=lambda: [1, 2, 4, 1])
     # for ladd
     ladd_multi_scale: bool = True
     head_block_ids: Optional[List[int]] = None

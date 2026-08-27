@@ -136,11 +136,27 @@ def configure_matting_trainable_parameters(
             type_embedding.requires_grad = True
     for parameter in core.final_layer.parameters():
         parameter.requires_grad = True
+    # The refinement head has no pretrained weights to adapt, so it trains in
+    # full. inject_matting_lora only wraps nn.Linear, so its convolutions are
+    # untouched, and trainable_state_dict picks them up from requires_grad.
+    refine_head = getattr(core, "refine_head", None)
+    if refine_head is not None:
+        for parameter in refine_head.parameters():
+            parameter.requires_grad = True
 
     trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_parameters = sum(p.numel() for p in model.parameters())
     return {
         "conditioning_mode": mode,
+        "refine_head": None
+        if refine_head is None
+        else {
+            "parameters": sum(p.numel() for p in refine_head.parameters()),
+            "in_channels": refine_head.in_channels,
+            "width": refine_head.width,
+            "dilations": refine_head.dilations,
+            "receptive_field": refine_head.receptive_field,
+        },
         "rank": int(rank),
         "alpha": float(alpha),
         "dropout": float(dropout),

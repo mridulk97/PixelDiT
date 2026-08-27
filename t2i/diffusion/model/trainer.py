@@ -84,6 +84,17 @@ class PixDiTTrainer(nn.Module):
                 extra.get("use_sequence_type_embedding", True),
             )
         )
+        use_refine_head = bool(
+            getattr(model_config, "use_refine_head", extra.get("use_refine_head", False))
+        )
+        refine_head_width = int(
+            getattr(model_config, "refine_head_width", extra.get("refine_head_width", 64))
+        )
+        refine_head_dilations = getattr(
+            model_config,
+            "refine_head_dilations",
+            extra.get("refine_head_dilations", (1, 2, 4, 1)),
+        )
         self.conditioning_proj_init = str(
             getattr(
                 model_config,
@@ -121,6 +132,9 @@ class PixDiTTrainer(nn.Module):
             sequence_rope_mode=sequence_rope_mode,
             sequence_rope_offset=sequence_rope_offset,
             use_sequence_type_embedding=use_sequence_type_embedding,
+            use_refine_head=use_refine_head,
+            refine_head_width=refine_head_width,
+            refine_head_dilations=tuple(refine_head_dilations),
         )
 
         self.image_size = int(image_size)
