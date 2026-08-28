@@ -239,6 +239,37 @@ def _validation_losses(model, diffusion, batch, embeddings, attention_mask, conf
 
 
 @torch.no_grad()
+def _subset_records(dataset):
+    """Describe the training subset without assuming one dataset's record shape.
+
+    AM-2K points at a composite on disk; D-646 names a foreground, an alpha and
+    the background they are blended over, because the composite is never
+    written out. Take whichever keys the dataset actually has.
+    """
+    records = []
+    for record in dataset.dataset:
+        entry = {"sample_id": record["sample_id"], "category": record.get("category")}
+        for source, target in (
+            ("image_path", "image"),
+            ("alpha_path", "alpha"),
+            ("foreground_path", "foreground"),
+            ("background", "background"),
+        ):
+            if source in record:
+                entry[target] = record[source]
+        records.append(entry)
+    return records
+
+
+def _subset_manifest(records, dataset_type):
+    """`images` lists only real files: matting_inference.py reads it and opens them."""
+    return {
+        "dataset": dataset_type,
+        "images": [record["image"] for record in records if "image" in record],
+        "records": records,
+    }
+
+
 def _rotating_preview_indices(dataset_size, num_examples, global_step):
     """A different slice of the subset at each preview.
 
@@ -475,19 +506,11 @@ def main(config: PixDiTConfig) -> None:
         run_metadata["gradient_accumulation_steps"],
         run_metadata["effective_batch_size"],
     )
-    subset_records = [
-        {
-            "sample_id": record["sample_id"],
-            "category": record["category"],
-            "image": record["image_path"],
-            "alpha": record["alpha_path"],
-        }
-        for record in dataset.dataset
-    ]
+    subset_records = _subset_records(dataset)
     if accelerator.is_main_process:
         manifest_path = Path(config.work_dir) / "overfit_manifest.json"
         manifest_path.write_text(
-            json.dumps({"images": [record["image"] for record in subset_records], "records": subset_records}, indent=2),
+            json.dumps(_subset_manifest(subset_records, config.data.type), indent=2),
             encoding="utf-8",
         )
     dataloader = DataLoader(
@@ -497,6 +520,11 @@ def main(config: PixDiTConfig) -> None:
         num_workers=config.train.num_workers,
         pin_memory=True,
         drop_last=True,
+        # An overfit subset is a couple of batches long, so workers would
+        # otherwise respawn every epoch -- thousands of times over a run. That
+        # costs process startup each time and, worse, throws away the
+        # per-worker composite cache D-646 depends on.
+        persistent_workers=config.train.num_workers > 0,
     )
     validation_loader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=False, num_workers=0)
     validation_batch = next(iter(validation_loader))
