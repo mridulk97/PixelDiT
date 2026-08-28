@@ -40,6 +40,8 @@ from diffusion.model.matting_losses import (
 from train_matting import (
     _band_loss_scale,
     _rotating_preview_indices,
+    _subset_manifest,
+    _subset_records,
     _fires_on,
     _decode_deterministic,
     _deterministic_inputs,
@@ -1050,6 +1052,60 @@ class ReportLayoutTests(unittest.TestCase):
 
             paired = build_pair_source(DATASET_LAYOUTS["am2k"], root, "train", 8)
             self.assertFalse(hasattr(paired, "dataset"))
+
+
+class SubsetManifestTests(unittest.TestCase):
+    """The manifest must not assume one dataset's record keys -- assuming
+    AM-2K's `image_path` crashed the first D-646 run at startup."""
+
+    class _Fake:
+        def __init__(self, records):
+            self.dataset = records
+
+    def test_paired_dataset_records_image_paths(self):
+        dataset = self._Fake([
+            {"sample_id": "a", "category": "cat", "image_path": "/x/a.jpg", "alpha_path": "/x/a.png"}
+        ])
+        records = _subset_records(dataset)
+        self.assertEqual(records[0]["image"], "/x/a.jpg")
+        self.assertEqual(records[0]["alpha"], "/x/a.png")
+        manifest = _subset_manifest(records, "AM2KMattingDataset")
+        self.assertEqual(manifest["images"], ["/x/a.jpg"])
+
+    def test_composited_dataset_has_no_image_paths(self):
+        dataset = self._Fake([
+            {
+                "sample_id": "fg_0",
+                "category": "fg",
+                "foreground_path": "/x/FG/fg.png",
+                "alpha_path": "/x/GT/fg.png",
+                "background": "bg000.jpg",
+            }
+        ])
+        records = _subset_records(dataset)
+        self.assertEqual(records[0]["foreground"], "/x/FG/fg.png")
+        self.assertEqual(records[0]["background"], "bg000.jpg")
+        self.assertNotIn("image", records[0])
+        manifest = _subset_manifest(records, "Distinctions646MattingDataset")
+        # No composite exists on disk, so nothing may be advertised as an image.
+        self.assertEqual(manifest["images"], [])
+        self.assertEqual(manifest["dataset"], "Distinctions646MattingDataset")
+
+    def test_manifest_serialises_for_the_real_datasets(self):
+        import json
+
+        for name, dataset in (
+            ("AM2KMattingDataset", AM2KMattingDataset(
+                data_dir=["/scratch/mridul/data/matting/am-2k"], resolution=64,
+                extra={"split": "train", "overfit_samples": 4, "overfit_seed": 2025})),
+            ("Distinctions646MattingDataset", Distinctions646MattingDataset(
+                data_dir=["/scratch/mridul/data/matting/distinctions-646"], resolution=64,
+                extra={"split": "train", "overfit_samples": 4, "overfit_seed": 2025})),
+        ):
+            with self.subTest(dataset=name):
+                manifest = _subset_manifest(_subset_records(dataset), name)
+                self.assertEqual(len(manifest["records"]), 4)
+                json.dumps(manifest)
 
 
 class PreviewRotationTests(unittest.TestCase):
